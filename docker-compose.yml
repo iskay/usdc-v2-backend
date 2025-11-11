@@ -61,7 +61,7 @@ services:
       PORT: ${PORT:-3000}
       HOST: ${HOST:-0.0.0.0}
       LOG_LEVEL: ${LOG_LEVEL:-info}
-      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-usdc_v2_backend}
+      DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: redis://redis:6379
       CORS_ORIGINS: ${CORS_ORIGINS:-}
       EVM_RPC_URLS: ${EVM_RPC_URLS:-}
