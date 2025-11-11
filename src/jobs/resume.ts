@@ -43,7 +43,8 @@ export async function resumeUnfinishedFlows(
     );
   } catch (error) {
     logger.error({ err: error }, 'Failed to resume unfinished flows');
-    throw error;
+    // Don't throw - allow app to start even if resume fails
+    // This can happen if database isn't ready yet or migrations haven't run
   }
 }
 

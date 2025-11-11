@@ -16,7 +16,18 @@ export async function buildApp() {
   const logger = container.resolve('logger');
 
   const app = Fastify({
-    logger
+    logger: {
+      level: config.logLevel,
+      transport: config.nodeEnv === 'development'
+        ? {
+            target: 'pino-pretty',
+            options: {
+              colorize: true,
+              translateTime: 'SYS:standard'
+            }
+          }
+        : undefined
+    }
   });
 
   await registerMiddleware(app, config);
@@ -29,10 +40,12 @@ export async function buildApp() {
   const jobRegistry = await registerJobs(container);
   await jobRegistry.start();
 
-  // Resume unfinished flows on startup
+  // Resume unfinished flows on startup (non-blocking)
   const txTrackerService = container.resolve('txTrackerService');
   const queueManager = container.resolve('queueManager');
-  await resumeUnfinishedFlows(queueManager, txTrackerService, logger);
+  resumeUnfinishedFlows(queueManager, txTrackerService, logger).catch((error) => {
+    logger.warn({ err: error }, 'Resume unfinished flows failed, continuing startup');
+  });
 
   const close = async () => {
     await app.close();

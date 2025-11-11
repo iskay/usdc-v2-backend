@@ -13,6 +13,49 @@ Modular TypeScript backend for blockchain transaction tracking and Cosmos forwar
 
 ## Quick Start
 
+### First Time Setup
+
+**Prerequisites:**
+- Docker Desktop installed and running
+- Just installed (optional, but recommended): `brew install just` or `cargo install just`
+
+**Steps:**
+
+1. **Set up environment variables:**
+   ```bash
+   cp .env.sample .env
+   # Edit .env if needed (defaults work for Docker Compose)
+   ```
+
+2. **Start all services:**
+   ```bash
+   # Using Just (recommended)
+   just up-d
+   
+   # Or using Docker Compose directly
+   docker compose -f docker-compose.dev.yml up -d
+   ```
+
+3. **Run database migrations (required on first setup):**
+   ```bash
+   # Using Just
+   just migrate
+   
+   # Or using Docker Compose directly
+   docker compose -f docker-compose.dev.yml exec backend npx prisma migrate dev
+   ```
+
+4. **Verify everything is working:**
+   ```bash
+   # Check health endpoint
+   curl http://localhost:3000/health
+   
+   # View logs
+   just logs
+   ```
+
+The backend will be available at `http://localhost:3000` with hot-reload enabled.
+
 ### Development (Docker Compose)
 
 **Using Just (recommended):**
@@ -32,6 +75,9 @@ just down
 
 # View logs
 just logs
+
+# Run migrations (after schema changes)
+just migrate
 ```
 
 **Using Docker Compose directly:**
@@ -43,9 +89,9 @@ docker compose -f docker-compose.dev.yml up
 docker compose -f docker-compose.dev.yml up -d
 ```
 
-The backend will be available at `http://localhost:3000` with hot-reload enabled.
-
 See `justfile` for all available commands, or run `just --list` to see them.
+
+**Important:** After starting containers for the first time, you must run migrations to create the database schema. See [Database Operations](#database-operations) for details.
 
 ### Development (Local)
 
@@ -54,7 +100,7 @@ See `justfile` for all available commands, or run `just --list` to see them.
 npm install
 
 # Set up environment variables
-cp .env.example .env  # Edit as needed
+cp .env.sample .env  # Edit as needed
 
 # Generate Prisma client
 npm run prisma:generate
@@ -150,20 +196,29 @@ For detailed database operations, see [docs/operations.md](./docs/operations.md)
 
 ### Quick Reference
 
-**Run migrations:**
+**Run migrations (required on first setup):**
 ```bash
+# Using Just
+just migrate
+
+# Or using Docker Compose
+docker compose -f docker-compose.dev.yml exec backend npx prisma migrate dev
+
+# Or locally (if not using Docker)
 npm run prisma:migrate
 ```
 
 **Backup database:**
 ```bash
-docker compose exec postgres pg_dump -U postgres usdc_v2_backend > backup.sql
+docker compose -f docker-compose.dev.yml exec postgres pg_dump -U postgres usdc_v2_backend > backup.sql
 ```
 
 **Restore database:**
 ```bash
-docker compose exec -T postgres psql -U postgres -d usdc_v2_backend < backup.sql
+docker compose -f docker-compose.dev.yml exec -T postgres psql -U postgres -d usdc_v2_backend < backup.sql
 ```
+
+**Note:** If you see errors about tables not existing, you need to run migrations first. This is a common issue on first setup.
 
 ## Docker
 

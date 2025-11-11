@@ -4,6 +4,7 @@ This guide covers operational tasks for the USDC v2 Backend, including database 
 
 ## Table of Contents
 
+- [First Time Setup](#first-time-setup)
 - [Starting and Stopping Services](#starting-and-stopping-services)
 - [Database Migrations](#database-migrations)
 - [Database Backup and Restore](#database-backup-and-restore)
@@ -11,6 +12,84 @@ This guide covers operational tasks for the USDC v2 Backend, including database 
 - [Production Backup Strategy](#production-backup-strategy)
 - [Redis Operations](#redis-operations)
 - [Environment Configuration](#environment-configuration)
+
+## First Time Setup
+
+### Prerequisites
+
+- Docker Desktop installed and running
+- Just installed (optional): `brew install just` or `cargo install just`
+
+### Step-by-Step Setup
+
+1. **Clone the repository and navigate to the backend directory:**
+   ```bash
+   cd usdc-v2-backend
+   ```
+
+2. **Create environment file:**
+   ```bash
+   cp .env.sample .env
+   ```
+   
+   The default `.env.sample` values work for Docker Compose. For local development, you may need to adjust `DATABASE_URL` and `REDIS_URL` to use `localhost` instead of service names.
+
+3. **Start Docker containers:**
+   ```bash
+   # Using Just
+   just up-d
+   
+   # Or using Docker Compose
+   docker compose -f docker-compose.dev.yml up -d
+   ```
+
+4. **Wait for services to be healthy:**
+   ```bash
+   # Check service status
+   docker compose -f docker-compose.dev.yml ps
+   
+   # Wait until all services show "healthy" status
+   ```
+
+5. **Run database migrations (⚠️ REQUIRED on first setup):**
+   ```bash
+   # Using Just
+   just migrate
+   
+   # Or using Docker Compose
+   docker compose -f docker-compose.dev.yml exec backend npx prisma migrate dev
+   ```
+   
+   This creates all the necessary database tables. **You must run this step before the backend will work.**
+
+6. **Verify setup:**
+   ```bash
+   # Check health endpoint
+   curl http://localhost:3000/health
+   
+   # Should return: {"status":"ok","uptime":...}
+   
+   # View backend logs
+   just logs
+   # Or: docker compose -f docker-compose.dev.yml logs -f backend
+   ```
+
+### Common First-Time Issues
+
+**Error: "Can't reach database server at localhost:5432"**
+- **Solution:** Ensure `DATABASE_URL` in `.env` uses the service name `postgres` (not `localhost`) when using Docker Compose
+- For Docker: `postgresql://postgres:postgres@postgres:5432/usdc_v2_backend`
+- For local: `postgresql://postgres:postgres@localhost:5432/usdc_v2_backend`
+
+**Error: "The table `public.TrackedTransaction` does not exist"**
+- **Solution:** Run database migrations: `just migrate` or `docker compose -f docker-compose.dev.yml exec backend npx prisma migrate dev`
+
+**Error: "Docker: command not found"**
+- **Solution:** Install Docker Desktop and ensure it's running. See [Docker Desktop installation guide](https://docs.docker.com/desktop/install/mac-install/)
+
+**Containers can't connect to each other**
+- **Solution:** Ensure all services are on the same Docker network. Check with `docker network inspect usdc-v2-backend_usdc-v2-backend-network`
+- Verify service names in connection strings match Docker Compose service names
 
 ## Starting and Stopping Services
 
@@ -62,13 +141,24 @@ docker compose restart backend
 
 ### Running Migrations
 
-**Development:**
-```bash
-# Using npm script (runs Prisma migrate dev)
-npm run prisma:migrate
+**⚠️ Important:** You **must** run migrations on first setup to create the database schema. The backend will not work until migrations are applied.
 
-# Or directly with Prisma
+**Development (Docker Compose):**
+```bash
+# Using Just (recommended)
+just migrate
+
+# Or using Docker Compose directly
 docker compose -f docker-compose.dev.yml exec backend npx prisma migrate dev
+
+# Or using npm script (if running locally, not in Docker)
+npm run prisma:migrate
+```
+
+**Development (Local):**
+```bash
+# If running backend locally (not in Docker)
+npm run prisma:migrate
 ```
 
 **Production:**
@@ -76,6 +166,11 @@ docker compose -f docker-compose.dev.yml exec backend npx prisma migrate dev
 # Run migrations in production container
 docker compose exec backend npx prisma migrate deploy
 ```
+
+**What migrations do:**
+- Create all database tables defined in `prisma/schema.prisma`
+- Set up indexes and relationships
+- Generate Prisma Client with updated types
 
 ### Creating a New Migration
 
