@@ -1,0 +1,71 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum FlowType {
+  deposit
+  payment
+}
+
+model TrackedTransaction {
+  id             String    @id @default(uuid())
+  txHash         String    @unique
+  chain          String
+  chainType      String
+  flowType       FlowType?
+  initialChain   String?
+  status         String
+  chainProgress  Json?
+  metadata       Json?
+  lastCheckedAt  DateTime?
+  nextCheckAfter DateTime?
+  errorState     Json?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  addressId      String?   @map("address_id")
+
+  address    TrackedAddress?        @relation(fields: [addressId], references: [id])
+  statusLogs TransactionStatusLog[]
+}
+
+model TransactionStatusLog {
+  id            String             @id @default(uuid())
+  transaction   TrackedTransaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  transactionId String             @map("transaction_id")
+  status        String
+  chain         String?
+  source        String?            @default("poller")
+  detail        Json?
+  createdAt     DateTime           @default(now())
+}
+
+model TrackedAddress {
+  id           String    @id @default(uuid())
+  address      String    @unique
+  chain        String
+  labels       String[]  @default([])
+  metadata     Json?
+  lastSyncedAt DateTime? @map("last_synced_at")
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  transactions TrackedTransaction[]
+  checkpoints  PollCheckpoint[]
+}
+
+model PollCheckpoint {
+  id        String          @id @default(uuid())
+  address   TrackedAddress? @relation(fields: [addressId], references: [id], onDelete: Cascade)
+  addressId String?         @map("address_id")
+  chain     String
+  cursor    String?
+  height    BigInt?
+  metadata  Json?
+  updatedAt DateTime        @updatedAt
+  createdAt DateTime        @default(now())
+}
