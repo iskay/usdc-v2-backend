@@ -10,7 +10,10 @@ export async function registerRoutes(app: FastifyInstance, container: AppContain
     uptime: process.uptime()
   }));
 
-  await registerTxTrackerController(app, container);
-  await registerAddressTrackerController(app, container);
+  // Register API routes under /api prefix
+  await app.register(async (apiApp) => {
+    await registerTxTrackerController(apiApp, container);
+    await registerAddressTrackerController(apiApp, container);
+  }, { prefix: '/api' });
 }
 

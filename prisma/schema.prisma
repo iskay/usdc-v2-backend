@@ -13,21 +13,22 @@ enum FlowType {
 }
 
 model TrackedTransaction {
-  id             String    @id @default(uuid())
-  txHash         String    @unique
-  chain          String
-  chainType      String
-  flowType       FlowType?
-  initialChain   String?
-  status         String
-  chainProgress  Json?
-  metadata       Json?
-  lastCheckedAt  DateTime?
-  nextCheckAfter DateTime?
-  errorState     Json?
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
-  addressId      String?   @map("address_id")
+  id               String    @id @default(uuid())
+  txHash           String    @unique
+  chain            String
+  chainType        String
+  flowType         FlowType?
+  initialChain     String?
+  destinationChain String?
+  status           String
+  chainProgress    Json?
+  metadata         Json?
+  lastCheckedAt    DateTime?
+  nextCheckAfter   DateTime?
+  errorState       Json?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  addressId        String?   @map("address_id")
 
   address    TrackedAddress?        @relation(fields: [addressId], references: [id])
   statusLogs TransactionStatusLog[]

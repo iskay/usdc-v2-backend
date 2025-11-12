@@ -18,12 +18,23 @@ export function createTxPollingProcessor(
   return async (job: Job<TxPollingJobData>) => {
     const { flowId, params } = job.data;
     logger.info({ flowId, jobId: job.id }, 'Processing transaction polling job');
+    logger.debug({ flowId, params }, 'Tx polling job parameters received');
 
     try {
       const flow = await repository.findById(flowId);
       if (!flow) {
         throw new Error(`Flow ${flowId} not found`);
       }
+
+      logger.debug(
+        {
+          flowId,
+          status: flow.status,
+          chainProgress: flow.chainProgress ?? null,
+          hasMetadata: Boolean(flow.metadata),
+        },
+        'Loaded flow for polling'
+      );
 
       // Check if flow is already completed or failed
       if (flow.status === 'completed' || flow.status === 'failed') {
@@ -32,6 +43,7 @@ export function createTxPollingProcessor(
       }
 
       // Start tracking via TrackerManager
+      logger.debug({ flowId }, 'Invoking trackerManager.startFlow');
       await trackerManager.startFlow(flow, params);
 
       logger.info({ flowId, jobId: job.id }, 'Transaction polling job completed');

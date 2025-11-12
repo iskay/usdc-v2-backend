@@ -23,14 +23,6 @@ export interface NamadaPollResult extends PollResult {
   namadaTxHash?: string;
 }
 
-interface BlockResults {
-  result?: {
-    end_block_events?: Array<{
-      type: string;
-      attributes?: Array<{ key: string; value: string; index?: boolean }>;
-    }>;
-  };
-}
 
 export function createNamadaPoller(
   rpcClient: TendermintRpcClient,
@@ -90,16 +82,37 @@ export function createNamadaPoller(
 
             try {
               const blockResults = await rpcClient.getBlockResults(nextHeight);
-              const json = blockResults as unknown as BlockResults;
-              const endEvents = json?.result?.end_block_events || [];
+              if (!blockResults) {
+                logger.debug(
+                  { flowId: params.flowId, height: nextHeight },
+                  'Namada deposit poll: no block results for height'
+                );
+                nextHeight++;
+                continue;
+              }
+              // Access end_block_events directly from blockResults (RPC client unwraps the result)
+              const endEvents = (blockResults as unknown as { end_block_events?: Array<{ type: string; attributes?: Array<{ key: string; value: string; index?: boolean }> }> }).end_block_events || [];
 
+              // First pass: Extract inner-tx-hash from message event (it's in a separate event, not in write_acknowledgement)
+              let innerTxHash: string | undefined;
+              for (const ev of endEvents) {
+                if (ev?.type === 'message') {
+                  const attrs = indexAttributes(ev.attributes);
+                  const inner = attrs['inner-tx-hash'];
+                  if (inner) {
+                    innerTxHash = inner;
+                    break;
+                  }
+                }
+              }
+
+              // Second pass: Find and process write_acknowledgement event
               for (const ev of endEvents) {
                 if (ev?.type !== 'write_acknowledgement') continue;
 
                 const attrs = indexAttributes(ev.attributes);
                 const ack = attrs['packet_ack'];
                 const pdata = attrs['packet_data'];
-                const inner = attrs['inner-tx-hash'];
                 const ok = ack === '{"result":"AQ=="}';
 
                 if (!ok) continue;
@@ -138,12 +151,14 @@ export function createNamadaPoller(
                   if (receiverMatches && senderMatches && denomMatches && amountMatches) {
                     ackFound = true;
                     foundAt = nextHeight;
-                    namadaTxHash = inner;
+                    // Use inner-tx-hash from message event (extracted in first pass)
+                    namadaTxHash = innerTxHash;
                     logger.info(
                       {
                         flowId: params.flowId,
                         height: nextHeight,
                         txHash: namadaTxHash,
+                        innerTxHashFromMessage: innerTxHash,
                       },
                       'Namada write_acknowledgement matched'
                     );

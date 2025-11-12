@@ -1,7 +1,7 @@
 import type { AppLogger } from '../common/utils/logger.js';
 import type { QueueManager } from './queue.js';
 import type { TxTrackerService } from '../modules/tx-tracker/service.js';
-import type { FlowTrackingParams } from '../modules/tx-tracker/trackerManager.js';
+import { buildFlowTrackingParams } from '../modules/tx-tracker/params.js';
 
 export async function resumeUnfinishedFlows(
   queueManager: QueueManager,
@@ -16,9 +16,7 @@ export async function resumeUnfinishedFlows(
 
     for (const flow of unfinishedFlows) {
       // Extract tracking params from flow metadata
-      const params: FlowTrackingParams = (flow.metadata as FlowTrackingParams) || {
-        evmBurnTxHash: flow.txHash || undefined,
-      };
+      const params = buildFlowTrackingParams(flow);
 
       // Enqueue polling job
       await queueManager.txPollingQueue.add(

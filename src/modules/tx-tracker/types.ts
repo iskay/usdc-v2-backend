@@ -47,13 +47,13 @@ export interface TrackTransactionInput {
 export interface MultiChainTrackInput {
   flowType: FlowType;
   initialChain: string;
-  chain: string;
+  destinationChain: string;
   chainType: string;
   chainProgress?: ChainProgress;
   metadata?: Record<string, unknown>;
   status?: string;
   errorState?: Record<string, unknown> | null;
-  txHash?: string | null;
+  txHash: string;
 }
 
 export interface TrackedTransaction {
@@ -63,6 +63,7 @@ export interface TrackedTransaction {
   chainType: string;
   flowType: FlowType | null;
   initialChain: string | null;
+  destinationChain: string | null;
   status: string;
   chainProgress: ChainProgress | null;
   metadata: Record<string, unknown> | null;

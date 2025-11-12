@@ -1,9 +1,13 @@
 import { Prisma } from '@prisma/client';
 
 import type { AppLogger } from '../../common/utils/logger.js';
-import type { AddStatusLogInput, TxTrackerRepository } from './repository.js';
+import { buildFlowTrackingParams, buildInitialChainProgress } from './params.js';
+import type { AddStatusLogInput, StatusLogEntry, TxTrackerRepository } from './repository.js';
 import type { FlowTrackingParams } from './trackerManager.js';
 import type { QueueManager } from '../../jobs/queue.js';
+import type { RpcClientFactory } from '../../common/rpc/index.js';
+import type { TendermintRpcClient } from '../../common/rpc/tendermintClient.js';
+import { getChainPollingConfig, type ChainPollingConfigs } from '../../config/chainConfigs.js';
 import type {
   ChainProgress,
   ChainStage,
@@ -34,12 +38,15 @@ export interface TxTrackerService {
   getById(id: string): Promise<TrackedTransaction | null>;
   listUnfinishedFlows(): Promise<TrackedTransaction[]>;
   appendClientStage(update: ClientStageUpdate): Promise<void>;
+  getStatusLogs(flowId: string): Promise<StatusLogEntry[]>;
 }
 
 export interface TxTrackerServiceDependencies {
   repository: TxTrackerRepository;
   queueManager: QueueManager;
   logger: AppLogger;
+  rpcFactory: RpcClientFactory;
+  chainPollingConfigs: ChainPollingConfigs;
 }
 
 const CLIENT_SOURCE: StatusSource = 'client';
@@ -47,7 +54,9 @@ const CLIENT_SOURCE: StatusSource = 'client';
 export function createTxTrackerService({
   repository,
   queueManager,
-  logger
+  logger,
+  rpcFactory,
+  chainPollingConfigs,
 }: TxTrackerServiceDependencies): TxTrackerService {
   async function ensureUnique(input: TrackTransactionInput): Promise<TrackedTransaction> {
     const existing = await repository.findByHash(input.txHash);
@@ -86,14 +95,35 @@ export function createTxTrackerService({
         }
       }
 
-      const created = await repository.createMultiChainFlow(input);
+      const startBlocks =
+        input.flowType != null
+          ? await resolveStartBlocks(
+              input.flowType,
+              input.destinationChain,
+              rpcFactory,
+              chainPollingConfigs,
+              logger
+            )
+          : {};
+
+      const chainProgress = buildInitialChainProgress(
+        input.flowType ?? null,
+        startBlocks,
+        input.chainProgress
+      );
+
+      const created = await repository.createMultiChainFlow({
+        ...input,
+        chainProgress,
+      });
       logger.debug(
         { flowId: created.id, flowType: created.flowType, initialChain: created.initialChain },
         'Created multi-chain flow'
       );
 
-      // Extract tracking params from input metadata
-      const params: FlowTrackingParams = (input.metadata as FlowTrackingParams) || {};
+      // Extract tracking params from created flow metadata
+      const params: FlowTrackingParams = buildFlowTrackingParams(created);
+      logger.debug({ flowId: created.id, params }, 'Derived tracking parameters for flow');
       
       // Enqueue polling job
       await queueManager.txPollingQueue.add(
@@ -176,6 +206,10 @@ export function createTxTrackerService({
         { flowId: update.flowId, stage: update.stage, chain: update.chain },
         'Appended client stage to flow'
       );
+    },
+
+    async getStatusLogs(flowId) {
+      return repository.getStatusLogs(flowId);
     }
   };
 }
@@ -227,4 +261,45 @@ function createStatusLogPayload(update: ClientStageUpdate, defaultSource: Status
       kind: update.kind ?? 'default'
     }
   };
+}
+
+async function resolveStartBlocks(
+  flowType: FlowType,
+  destinationChain: string | null | undefined,
+  rpcFactory: RpcClientFactory,
+  chainPollingConfigs: ChainPollingConfigs,
+  logger: AppLogger
+): Promise<{ nobleStart?: number; namadaStart?: number; evmStart?: number }> {
+  const result: { nobleStart?: number; namadaStart?: number; evmStart?: number } = {};
+
+  async function compute(chainId: string | undefined): Promise<number | undefined> {
+    if (!chainId) return undefined;
+    try {
+      const client = rpcFactory(chainId);
+      if (!('getLatestBlockHeight' in client)) {
+        return undefined;
+      }
+      const tendermintClient = client as TendermintRpcClient;
+      const config = getChainPollingConfig(chainPollingConfigs, chainId);
+      const latest = await tendermintClient.getLatestBlockHeight();
+      const start = Math.max(0, latest - config.blockWindowBackscan);
+      logger.debug({ chain: chainId, latest, start }, 'Computed start block for flow');
+      return start;
+    } catch (error) {
+      logger.warn({ err: error, chain: chainId }, 'Failed to compute start block for chain');
+      return undefined;
+    }
+  }
+
+  if (flowType === 'deposit') {
+    result.nobleStart = await compute('noble-testnet');
+    const namadaChain = destinationChain ?? 'namada-testnet';
+    result.namadaStart = await compute(namadaChain);
+  } else if (flowType === 'payment') {
+    result.namadaStart = await compute('namada-testnet');
+    result.nobleStart = await compute('noble-testnet');
+    // EVM polling start block not required yet; placeholder for future extension
+  }
+
+  return result;
 }

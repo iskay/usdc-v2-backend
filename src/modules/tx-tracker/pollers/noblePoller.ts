@@ -36,20 +36,6 @@ export interface NoblePollResult extends PollResult {
   cctpAt?: number;
 }
 
-interface BlockResults {
-  result?: {
-    txs_results?: Array<{
-      events?: Array<{
-        type: string;
-        attributes?: Array<{ key: string; value: string; index?: boolean }>;
-      }>;
-    }>;
-    finalize_block_events?: Array<{
-      type: string;
-      attributes?: Array<{ key: string; value: string; index?: boolean }>;
-    }>;
-  };
-}
 
 export function createNoblePoller(
   rpcClient: TendermintRpcClient,
@@ -92,6 +78,16 @@ export function createNoblePoller(
             'Noble deposit poll progress'
           );
 
+          // If nextHeight is ahead of latest, wait for chain to catch up
+          if (nextHeight > latest) {
+            logger.debug(
+              { flowId: params.flowId, nextHeight, latest },
+              'Noble deposit poll: waiting for chain to catch up'
+            );
+            await sleep(intervalMs);
+            continue;
+          }
+
           while (nextHeight <= latest && (!receivedFound || !forwardFound)) {
             if (abortSignal.aborted) break;
 
@@ -99,17 +95,77 @@ export function createNoblePoller(
 
             try {
               const blockResults = await rpcClient.getBlockResults(nextHeight);
-              const json = blockResults as unknown as BlockResults;
+              if (!blockResults) {
+                logger.debug(
+                  { flowId: params.flowId, height: nextHeight },
+                  'Noble deposit poll: no block results for height'
+                );
+                nextHeight++;
+                continue;
+              }
 
               // 1) coin_received in txs_results
-              const txs = json?.result?.txs_results || [];
-              for (const tx of txs) {
+              const txs = blockResults.txs_results || [];
+              logger.debug(
+                {
+                  flowId: params.flowId,
+                  height: nextHeight,
+                  txCount: txs.length,
+                },
+                'Noble deposit poll: scanning transactions'
+              );
+
+              for (let txIdx = 0; txIdx < txs.length; txIdx++) {
+                const tx = txs[txIdx];
                 const events = tx?.events || [];
-                for (const ev of events) {
+                logger.debug(
+                  {
+                    flowId: params.flowId,
+                    height: nextHeight,
+                    txIndex: txIdx,
+                    eventCount: events.length,
+                  },
+                  'Noble deposit poll: scanning transaction events'
+                );
+
+                for (let evIdx = 0; evIdx < events.length; evIdx++) {
+                  const ev = events[evIdx];
+                  logger.debug(
+                    {
+                      flowId: params.flowId,
+                      height: nextHeight,
+                      txIndex: txIdx,
+                      eventIndex: evIdx,
+                      eventType: ev?.type,
+                      attributeCount: ev?.attributes?.length ?? 0,
+                    },
+                    'Noble deposit poll: examining event'
+                  );
+
                   if (!receivedFound && ev?.type === 'coin_received') {
-                    const attrs = indexAttributes(ev.attributes);
+                    const rawAttrs = ev.attributes || [];
+                    const attrs = indexAttributes(rawAttrs);
                     const receiver = attrs['receiver'];
                     const amount = attrs['amount'];
+
+                    logger.debug(
+                      {
+                        flowId: params.flowId,
+                        height: nextHeight,
+                        txIndex: txIdx,
+                        eventIndex: evIdx,
+                        rawAttributes: rawAttrs,
+                        indexedAttributes: attrs,
+                        extractedReceiver: receiver,
+                        extractedAmount: amount,
+                        expectedReceiver: params.forwardingAddress,
+                        expectedAmount: params.expectedAmountUusdc,
+                        receiverMatch: receiver === params.forwardingAddress,
+                        amountMatch: amount === params.expectedAmountUusdc,
+                      },
+                      'Noble deposit poll: coin_received match attempt'
+                    );
+
                     if (
                       params.forwardingAddress &&
                       receiver === params.forwardingAddress &&
@@ -123,19 +179,81 @@ export function createNoblePoller(
                         'Noble coin_received matched'
                       );
                       onUpdate?.({ height: nextHeight, receivedFound, forwardFound });
+                    } else {
+                      logger.debug(
+                        {
+                          flowId: params.flowId,
+                          height: nextHeight,
+                          reason: !params.forwardingAddress
+                            ? 'missing_forwarding_address'
+                            : receiver !== params.forwardingAddress
+                              ? 'receiver_mismatch'
+                              : !params.expectedAmountUusdc
+                                ? 'missing_expected_amount'
+                                : amount !== params.expectedAmountUusdc
+                                  ? 'amount_mismatch'
+                                  : 'unknown',
+                        },
+                        'Noble deposit poll: coin_received did not match'
+                      );
                     }
                   }
                 }
               }
 
               // 2) ibc_transfer in finalize_block_events
-              const endEvents = json?.result?.finalize_block_events || [];
-              for (const ev of endEvents) {
+              const endEvents = blockResults.finalize_block_events || [];
+              logger.debug(
+                {
+                  flowId: params.flowId,
+                  height: nextHeight,
+                  endEventCount: endEvents.length,
+                },
+                'Noble deposit poll: scanning finalize_block_events'
+              );
+
+              for (let evIdx = 0; evIdx < endEvents.length; evIdx++) {
+                const ev = endEvents[evIdx];
+                logger.debug(
+                  {
+                    flowId: params.flowId,
+                    height: nextHeight,
+                    eventIndex: evIdx,
+                    eventType: ev?.type,
+                    attributeCount: ev?.attributes?.length ?? 0,
+                  },
+                  'Noble deposit poll: examining finalize_block event'
+                );
+
                 if (!forwardFound && ev?.type === 'ibc_transfer') {
-                  const attrs = indexAttributes(ev.attributes);
+                  const rawAttrs = ev.attributes || [];
+                  const attrs = indexAttributes(rawAttrs);
                   const sender = attrs['sender'];
                   const receiver = attrs['receiver'];
                   const denom = attrs['denom'];
+                  const amount = attrs['amount'];
+
+                  logger.debug(
+                    {
+                      flowId: params.flowId,
+                      height: nextHeight,
+                      eventIndex: evIdx,
+                      rawAttributes: rawAttrs,
+                      indexedAttributes: attrs,
+                      extractedSender: sender,
+                      extractedReceiver: receiver,
+                      extractedDenom: denom,
+                      extractedAmount: amount,
+                      expectedSender: params.forwardingAddress,
+                      expectedReceiver: params.namadaReceiver,
+                      expectedDenom: 'uusdc',
+                      senderMatch: sender === params.forwardingAddress,
+                      receiverMatch: receiver === params.namadaReceiver,
+                      denomMatch: denom === 'uusdc',
+                    },
+                    'Noble deposit poll: ibc_transfer match attempt'
+                  );
+
                   if (
                     params.forwardingAddress &&
                     params.namadaReceiver &&
@@ -150,6 +268,25 @@ export function createNoblePoller(
                       'Noble ibc_transfer matched'
                     );
                     onUpdate?.({ height: nextHeight, receivedFound, forwardFound });
+                  } else {
+                    logger.debug(
+                      {
+                        flowId: params.flowId,
+                        height: nextHeight,
+                        reason: !params.forwardingAddress
+                          ? 'missing_forwarding_address'
+                          : !params.namadaReceiver
+                            ? 'missing_namada_receiver'
+                            : sender !== params.forwardingAddress
+                              ? 'sender_mismatch'
+                              : receiver !== params.namadaReceiver
+                                ? 'receiver_mismatch'
+                                : denom !== 'uusdc'
+                                  ? 'denom_mismatch'
+                                  : 'unknown',
+                      },
+                      'Noble deposit poll: ibc_transfer did not match'
+                    );
                   }
                 }
               }
@@ -221,8 +358,15 @@ export function createNoblePoller(
 
             try {
               const blockResults = await rpcClient.getBlockResults(nextHeight);
-              const json = blockResults as unknown as BlockResults;
-              const txs = json?.result?.txs_results || [];
+              if (!blockResults) {
+                logger.debug(
+                  { flowId: params.flowId, height: nextHeight },
+                  'Noble orbiter poll: no block results for height'
+                );
+                nextHeight++;
+                continue;
+              }
+              const txs = blockResults.txs_results || [];
 
               for (const tx of txs) {
                 const events = tx?.events || [];

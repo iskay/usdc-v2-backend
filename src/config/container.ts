@@ -84,8 +84,14 @@ export async function createAppContainer(config: AppConfig): Promise<AppContaine
         logger
       })
     ).singleton(),
-    txTrackerService: asFunction(({ txTrackerRepository, queueManager, logger }) =>
-      createTxTrackerService({ repository: txTrackerRepository, queueManager, logger })
+    txTrackerService: asFunction(({ txTrackerRepository, queueManager, logger, rpcClientFactory, chainPollingConfigs: pollingConfigs }) =>
+      createTxTrackerService({
+        repository: txTrackerRepository,
+        queueManager,
+        logger,
+        rpcFactory: rpcClientFactory,
+        chainPollingConfigs: pollingConfigs
+      })
     ).singleton(),
     addressTrackerRepository: asFunction(({ prisma }) => createAddressTrackerRepository(prisma)).singleton(),
     addressTrackerService: asFunction(({ addressTrackerRepository, logger }) =>

@@ -16,16 +16,28 @@ const DEFAULT_POLLING_CONFIG: ChainPollingConfig = {
 };
 
 const FALLBACK_CHAIN_CONFIGS: ChainPollingConfigs = {
-  'sepolia-testnet': {
+  // EVM chains - matching frontend evm-chains.json keys
+  'sepolia': {
     maxDurationMin: 10,
     blockWindowBackscan: 5,
     pollIntervalMs: 5000,
   },
-  'base-sepolia-testnet': {
+  'base-sepolia': {
     maxDurationMin: 10,
     blockWindowBackscan: 5,
     pollIntervalMs: 5000,
   },
+  'avalanche-fuji': {
+    maxDurationMin: 10,
+    blockWindowBackscan: 5,
+    pollIntervalMs: 5000,
+  },
+  'polygon-amoy': {
+    maxDurationMin: 10,
+    blockWindowBackscan: 5,
+    pollIntervalMs: 5000,
+  },
+  // Tendermint chains
   'noble-testnet': {
     maxDurationMin: 20,
     blockWindowBackscan: 10,

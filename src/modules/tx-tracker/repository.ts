@@ -26,6 +26,16 @@ export interface UpdateChainProgressInput {
   nextCheckAfter?: Date | null;
 }
 
+export interface StatusLogEntry {
+  id: string;
+  transactionId: string;
+  status: string;
+  chain: string | null;
+  source: string | null;
+  detail: Record<string, unknown> | null;
+  createdAt: Date;
+}
+
 export interface TxTrackerRepository {
   create(input: TrackTransactionInput): Promise<TrackedTransaction>;
   createMultiChainFlow(input: MultiChainTrackInput): Promise<TrackedTransaction>;
@@ -35,6 +45,7 @@ export interface TxTrackerRepository {
   update(id: string, changes: Partial<TrackedTransaction>): Promise<TrackedTransaction>;
   updateChainProgress(id: string, changes: UpdateChainProgressInput): Promise<TrackedTransaction>;
   addStatusLog(entry: AddStatusLogInput): Promise<void>;
+  getStatusLogs(transactionId: string): Promise<StatusLogEntry[]>;
 }
 
 type TrackedTransactionModel = Prisma.TrackedTransactionGetPayload<Record<string, unknown>>;
@@ -132,6 +143,23 @@ export function createTxTrackerRepository(prisma: PrismaClient): TxTrackerReposi
           detail: toJsonInputValue(entry.detail)
         }
       });
+    },
+
+    async getStatusLogs(transactionId) {
+      const entities = await prisma.transactionStatusLog.findMany({
+        where: { transactionId },
+        orderBy: { createdAt: 'asc' }
+      });
+
+      return entities.map((entity) => ({
+        id: entity.id,
+        transactionId: entity.transactionId,
+        status: entity.status,
+        chain: entity.chain,
+        source: entity.source,
+        detail: (entity.detail as Record<string, unknown> | null) ?? null,
+        createdAt: entity.createdAt
+      }));
     }
   };
 }
@@ -159,11 +187,12 @@ function buildCreateData(input: TrackTransactionInput): Prisma.TrackedTransactio
 
 function buildMultiChainCreateData(input: MultiChainTrackInput): Prisma.TrackedTransactionCreateInput {
   return {
-    txHash: input.txHash ?? `flow-${randomUUID()}`,
-    chain: input.chain,
+    txHash: input.txHash,
+    chain: input.initialChain, // Keep chain field for backward compatibility (set to initialChain)
     chainType: input.chainType,
     flowType: input.flowType,
     initialChain: input.initialChain,
+    destinationChain: input.destinationChain,
     status: input.status ?? DEFAULT_STATUS,
     chainProgress: toJsonInputValue(input.chainProgress),
     metadata: toJsonInputValue(input.metadata),
@@ -223,6 +252,7 @@ function mapTrackedTransaction(entity: TrackedTransactionModel): TrackedTransact
     chainType: entity.chainType,
     flowType: (entity.flowType as TrackedTransaction['flowType']) ?? null,
     initialChain: entity.initialChain ?? null,
+    destinationChain: entity.destinationChain ?? null,
     status: entity.status,
     chainProgress: (entity.chainProgress as ChainProgress | null) ?? null,
     metadata: (entity.metadata as Record<string, unknown> | null) ?? null,

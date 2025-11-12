@@ -16,6 +16,7 @@ import type {
   TrackedTransaction,
   TxStatusUpdate,
 } from './types.js';
+import type { TendermintRpcClient } from '../../common/rpc/tendermintClient.js';
 
 export interface TrackerManager {
   startFlow(
@@ -92,9 +93,33 @@ export function createTrackerManager({
       [chain]: updatedEntry,
     };
 
-    return repository.updateChainProgress(flowId, {
+    logger.debug(
+      {
+        flowId,
+        chain,
+        updates,
+        currentChainEntry: chainEntry,
+        updatedChainEntry: updatedEntry,
+        updatedProgress,
+      },
+      'Updating chain progress'
+    );
+
+    const result = await repository.updateChainProgress(flowId, {
       chainProgress: updatedProgress,
     });
+
+    logger.debug(
+      {
+        flowId,
+        chain,
+        resultChainProgress: result?.chainProgress,
+        resultChainStatus: result?.chainProgress?.[chain]?.status,
+      },
+      'Chain progress updated'
+    );
+
+    return result;
   }
 
   function addStatusLog(
@@ -116,6 +141,44 @@ export function createTrackerManager({
     });
   }
 
+  async function ensureStartBlock(
+    flow: TrackedTransaction,
+    chain: keyof ChainProgress,
+    rpcClient: TendermintRpcClient,
+    blockWindowBackscan: number
+  ): Promise<number> {
+    const currentProgress = flow.chainProgress ?? {};
+    const chainEntry = currentProgress[chain];
+
+    if (chainEntry?.startBlock !== undefined) {
+      return chainEntry.startBlock;
+    }
+
+    const latest = await rpcClient.getLatestBlockHeight();
+    const startBlock = Math.max(0, latest - blockWindowBackscan);
+    logger.debug({ flowId: flow.id, chain, startBlock, latest }, 'Persisting start block for flow');
+
+    const updatedEntry: ChainProgressEntry = {
+      ...(chainEntry ?? {}),
+      startBlock,
+    };
+
+    const updatedProgress: ChainProgress = {
+      ...currentProgress,
+      [chain]: updatedEntry,
+    };
+
+    await repository.updateChainProgress(flow.id, {
+      chainProgress: updatedProgress,
+      nextCheckAfter: new Date(),
+    });
+
+    // Mutate local flow object to avoid re-fetch
+    flow.chainProgress = updatedProgress;
+
+    return startBlock;
+  }
+
   async function trackDepositFlow(
     flow: TrackedTransaction,
     params: FlowTrackingParams
@@ -124,8 +187,27 @@ export function createTrackerManager({
     activeFlows.set(flow.id, abortController);
 
     try {
+      logger.debug(
+        {
+          flowId: flow.id,
+          params,
+          chainProgress: flow.chainProgress ?? null,
+        },
+        'Starting deposit flow tracking'
+      );
       // Step 1: Track EVM burn
-      if (params.evmBurnTxHash && flow.chainProgress?.evm) {
+      const evmProgress = flow.chainProgress?.evm;
+      const hasEvmPrereqs = Boolean(params.evmBurnTxHash && evmProgress);
+      logger.debug(
+        {
+          flowId: flow.id,
+          hasEvmPrereqs,
+          hasEvmBurnTxHash: Boolean(params.evmBurnTxHash),
+          hasEvmProgress: Boolean(evmProgress),
+        },
+        'Evaluated EVM burn polling prerequisites'
+      );
+      if (hasEvmPrereqs) {
         logger.info({ flowId: flow.id }, 'Starting EVM burn tracking');
         const evmChain = flow.initialChain || flow.chain;
         const pollConfig = getPollingConfig(evmChain);
@@ -183,19 +265,46 @@ export function createTrackerManager({
         } else {
           throw new Error('EVM burn not found');
         }
+      } else {
+        logger.debug(
+          {
+            flowId: flow.id,
+            reason: 'missing_prerequisites',
+            hasEvmBurnTxHash: Boolean(params.evmBurnTxHash),
+            hasEvmChainProgress: Boolean(flow.chainProgress?.evm),
+          },
+          'Skipping EVM burn polling step'
+        );
       }
 
       // Step 2: Track Noble CCTP mint and IBC forward
-      if (params.forwardingAddress && params.namadaReceiver) {
+      const hasNoblePrereqs = Boolean(params.forwardingAddress && params.namadaReceiver);
+      logger.debug(
+        {
+          flowId: flow.id,
+          hasNoblePrereqs,
+          forwardingAddress: params.forwardingAddress,
+          namadaReceiver: params.namadaReceiver,
+        },
+        'Evaluated Noble polling prerequisites'
+      );
+      if (hasNoblePrereqs) {
         logger.info({ flowId: flow.id }, 'Starting Noble tracking');
-        const nobleChain = 'noble-testnet'; // TODO: Get from registry
+        const nobleChain = 'noble-testnet'; // Get from registry or use default
         const pollConfig = getPollingConfig(nobleChain);
         const rpcClient = rpcFactory(nobleChain) as TendermintRpcClient;
         const noblePoller = createNoblePoller(rpcClient, logger);
 
-        const startHeight =
-          flow.chainProgress?.noble?.startBlock ??
-          (await rpcClient.getLatestBlockHeight()) - pollConfig.blockWindowBackscan;
+        const startHeight = await ensureStartBlock(
+          flow,
+          'noble',
+          rpcClient,
+          pollConfig.blockWindowBackscan
+        );
+        logger.debug(
+          { flowId: flow.id, startHeight },
+          'Using start height for Noble polling'
+        );
 
         const nobleResult = await noblePoller.pollForDeposit(
           {
@@ -213,7 +322,7 @@ export function createTrackerManager({
             if (update.receivedFound) {
               emitStatusUpdate({
                 flowId: flow.id,
-                chain: 'noble',
+                chain: nobleChain,
                 stage: 'noble_cctp_minted',
                 status: 'confirmed',
                 occurredAt: new Date(),
@@ -223,7 +332,7 @@ export function createTrackerManager({
             if (update.forwardFound) {
               emitStatusUpdate({
                 flowId: flow.id,
-                chain: 'noble',
+                chain: nobleChain,
                 stage: 'noble_ibc_forwarded',
                 status: 'confirmed',
                 occurredAt: new Date(),
@@ -254,24 +363,51 @@ export function createTrackerManager({
         if (!nobleResult.receivedFound || !nobleResult.forwardFound) {
           throw new Error('Noble deposit tracking incomplete');
         }
+      } else {
+        logger.warn(
+          {
+            flowId: flow.id,
+            reason: 'missing_prerequisites',
+            forwardingAddress: params.forwardingAddress,
+            namadaReceiver: params.namadaReceiver,
+          },
+          'Cannot start Noble polling due to missing parameters'
+        );
       }
 
       // Step 3: Track Namada receive
-      if (params.namadaReceiver) {
+      const hasNamadaPrereqs = Boolean(params.namadaReceiver);
+      logger.debug(
+        {
+          flowId: flow.id,
+          hasNamadaPrereqs,
+          namadaReceiver: params.namadaReceiver,
+        },
+        'Evaluated Namada polling prerequisites'
+      );
+      if (hasNamadaPrereqs) {
         logger.info({ flowId: flow.id }, 'Starting Namada tracking');
-        const namadaChain = 'namada-testnet'; // TODO: Get from registry
-        const pollConfig = getPollingConfig(namadaChain);
-        const rpcClient = rpcFactory(namadaChain) as TendermintRpcClient;
+        const namadaChainId = 'namada-testnet'; // Chain ID for RPC client and polling config
+        const namadaChain = 'namada' as keyof ChainProgress; // Chain key for ChainProgress
+        const pollConfig = getPollingConfig(namadaChainId);
+        const rpcClient = rpcFactory(namadaChainId) as TendermintRpcClient;
         const namadaPoller = createNamadaPoller(rpcClient, logger);
 
-        const startHeight =
-          flow.chainProgress?.namada?.startBlock ??
-          (await rpcClient.getLatestBlockHeight()) - pollConfig.blockWindowBackscan;
+        const startHeight = await ensureStartBlock(
+          flow,
+          namadaChain,
+          rpcClient,
+          pollConfig.blockWindowBackscan
+        );
+        logger.debug(
+          { flowId: flow.id, startHeight },
+          'Using start height for Namada polling'
+        );
 
         const namadaResult = await namadaPoller.pollForDeposit(
           {
             flowId: flow.id,
-            chain: namadaChain,
+            chain: namadaChainId,
             startHeight,
             forwardingAddress: params.forwardingAddress,
             namadaReceiver: params.namadaReceiver,
@@ -284,7 +420,7 @@ export function createTrackerManager({
             if (update.ackFound) {
               emitStatusUpdate({
                 flowId: flow.id,
-                chain: 'namada',
+                chain: namadaChain,
                 stage: 'namada_received',
                 status: 'confirmed',
                 txHash: update.namadaTxHash as string | undefined,
@@ -297,13 +433,28 @@ export function createTrackerManager({
 
         if (abortController.signal.aborted) return;
 
+        logger.debug(
+          {
+            flowId: flow.id,
+            namadaResult,
+            hasFound: Boolean(namadaResult.found),
+            hasNamadaTxHash: Boolean(namadaResult.namadaTxHash),
+            conditionMet: Boolean(namadaResult.found && namadaResult.namadaTxHash),
+          },
+          'Namada polling result evaluation'
+        );
+
         if (namadaResult.found && namadaResult.namadaTxHash) {
-          await updateChainProgress(flow.id, 'namada', {
+          logger.info(
+            { flowId: flow.id, namadaTxHash: namadaResult.namadaTxHash },
+            'Updating Namada chain progress to confirmed'
+          );
+          await updateChainProgress(flow.id, namadaChain, {
             status: 'confirmed',
             txHash: namadaResult.namadaTxHash,
             lastCheckedAt: new Date(),
           });
-          await addStatusLog(flow.id, 'namada', 'namada_received', 'confirmed', {
+          await addStatusLog(flow.id, namadaChain, 'namada_received', 'confirmed', {
             txHash: namadaResult.namadaTxHash,
           });
           emitStatusUpdate({
@@ -323,6 +474,14 @@ export function createTrackerManager({
         } else {
           throw new Error('Namada receive not found');
         }
+      } else {
+        logger.warn(
+          {
+            flowId: flow.id,
+            reason: 'missing_namada_receiver',
+          },
+          'Cannot start Namada polling due to missing namadaReceiver'
+        );
       }
     } catch (error) {
       logger.error({ err: error, flowId: flow.id }, 'Deposit flow tracking error');
@@ -360,7 +519,9 @@ export function createTrackerManager({
         logger.info({ flowId: flow.id }, 'Starting Namada IBC tracking');
         // TODO: Implement Namada IBC send tracking
         // For now, assume it's already confirmed if txHash provided
-        await updateChainProgress(flow.id, 'namada', {
+        const namadaChainId = 'namada-testnet'; // Chain ID for RPC client and polling config
+        const namadaChain = 'namada' as keyof ChainProgress; // Chain key for ChainProgress
+        await updateChainProgress(flow.id, namadaChain, {
           status: 'confirmed',
           txHash: params.namadaIbcTxHash,
           lastCheckedAt: new Date(),
@@ -370,7 +531,7 @@ export function createTrackerManager({
       // Step 2: Track Noble receive and CCTP burn
       if (params.memoJson && params.receiver && params.amount) {
         logger.info({ flowId: flow.id }, 'Starting Noble payment tracking');
-        const nobleChain = 'noble-testnet';
+        const nobleChain = 'noble';
         const pollConfig = getPollingConfig(nobleChain);
         const rpcClient = rpcFactory(nobleChain) as TendermintRpcClient;
         const noblePoller = createNoblePoller(rpcClient, logger);
@@ -399,7 +560,7 @@ export function createTrackerManager({
             if (update.ackFound) {
               emitStatusUpdate({
                 flowId: flow.id,
-                chain: 'noble',
+                chain: nobleChain,
                 stage: 'noble_received',
                 status: 'confirmed',
                 occurredAt: new Date(),
@@ -409,7 +570,7 @@ export function createTrackerManager({
             if (update.cctpFound) {
               emitStatusUpdate({
                 flowId: flow.id,
-                chain: 'noble',
+                chain: nobleChain,
                 stage: 'noble_cctp_burned',
                 status: 'confirmed',
                 occurredAt: new Date(),
@@ -441,7 +602,7 @@ export function createTrackerManager({
       // Step 3: Track EVM mint
       if (params.mintRecipientB64) {
         logger.info({ flowId: flow.id }, 'Starting EVM mint tracking');
-        const evmChain = flow.chain; // TODO: Determine target EVM chain
+        const evmChain = flow.destinationChain || flow.chain; // Use destinationChain for payment flows
         const pollConfig = getPollingConfig(evmChain);
         const rpcClient = rpcFactory(evmChain) as EvmRpcClient;
         const evmPoller = createEvmPoller(rpcClient, logger);

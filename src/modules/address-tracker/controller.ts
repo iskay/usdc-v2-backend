@@ -8,7 +8,7 @@ const registerBodySchema = z.object({
   address: z.string().min(1, 'address is required'),
   chain: z.string().min(1, 'chain is required'),
   labels: z.array(z.string()).optional(),
-  metadata: z.record(z.unknown()).optional()
+  metadata: z.record(z.string(), z.any()).optional()
 });
 
 export async function registerAddressTrackerController(
