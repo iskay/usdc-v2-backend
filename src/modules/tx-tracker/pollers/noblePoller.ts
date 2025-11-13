@@ -9,6 +9,9 @@ import {
   indexAttributes,
   parseMaybeJsonOrBase64Json,
   stripQuotes,
+  retryWithBackoff,
+  isTransientError,
+  isPermanentError,
 } from './base.js';
 
 export interface NoblePollParams extends PollParams {
@@ -54,12 +57,15 @@ export function createNoblePoller(
     async pollForDeposit(params, onUpdate) {
       const timeoutMs = params.timeoutMs ?? 30 * 60 * 1000;
       const intervalMs = params.intervalMs ?? 5000;
-      const { controller, cleanup } = createPollTimeout(
+      const blockRequestDelayMs = params.blockRequestDelayMs ?? 100;
+      const { controller, cleanup, wasTimeout } = createPollTimeout(
         timeoutMs,
         logger,
         params.flowId
       );
       const abortSignal = params.abortSignal || controller.signal;
+      // Check both signals: external abortSignal and internal controller.signal (for timeout)
+      const isAborted = () => abortSignal.aborted || controller.signal.aborted;
 
       const deadline = Date.now() + timeoutMs;
       let nextHeight = params.startHeight;
@@ -70,7 +76,7 @@ export function createNoblePoller(
 
       try {
         while (Date.now() < deadline && (!receivedFound || !forwardFound)) {
-          if (abortSignal.aborted) break;
+          if (isAborted()) break;
 
           const latest = await rpcClient.getLatestBlockHeight();
           logger.debug(
@@ -89,18 +95,27 @@ export function createNoblePoller(
           }
 
           while (nextHeight <= latest && (!receivedFound || !forwardFound)) {
-            if (abortSignal.aborted) break;
+            if (isAborted()) break;
 
             onUpdate?.({ height: nextHeight, receivedFound, forwardFound });
 
             try {
-              const blockResults = await rpcClient.getBlockResults(nextHeight);
+              // Retry with exponential backoff for transient errors
+              const blockResults = await retryWithBackoff(
+                () => rpcClient.getBlockResults(nextHeight),
+                3, // max retries
+                500, // initial delay 500ms
+                5000 // max delay 5s
+              );
+              
               if (!blockResults) {
                 logger.debug(
                   { flowId: params.flowId, height: nextHeight },
                   'Noble deposit poll: no block results for height'
                 );
                 nextHeight++;
+                // Add delay before next block request
+                await sleep(blockRequestDelayMs);
                 continue;
               }
 
@@ -291,13 +306,31 @@ export function createNoblePoller(
                 }
               }
             } catch (error) {
+              // Check if error is permanent (404 = block doesn't exist)
+              if (isPermanentError(error)) {
+                logger.debug(
+                  { err: error, flowId: params.flowId, height: nextHeight },
+                  'Noble deposit poll: permanent error for height, skipping'
+                );
+                nextHeight++;
+                await sleep(blockRequestDelayMs);
+                continue;
+              }
+              
+              // Transient errors should have been retried by retryWithBackoff
+              // If we still get here, log warning and skip block after max retries
               logger.warn(
                 { err: error, flowId: params.flowId, height: nextHeight },
-                'Noble deposit poll fetch failed for height'
+                'Noble deposit poll fetch failed for height after retries, skipping block'
               );
+              nextHeight++;
+              await sleep(blockRequestDelayMs);
+              continue;
             }
 
             nextHeight++;
+            // Add delay before next block request to avoid rate limiting
+            await sleep(blockRequestDelayMs);
           }
 
           if (receivedFound && forwardFound) break;
@@ -327,12 +360,15 @@ export function createNoblePoller(
     async pollForOrbiter(params, onUpdate) {
       const timeoutMs = params.timeoutMs ?? 30 * 60 * 1000;
       const intervalMs = params.intervalMs ?? 5000;
-      const { controller, cleanup } = createPollTimeout(
+      const blockRequestDelayMs = params.blockRequestDelayMs ?? 100;
+      const { controller, cleanup, wasTimeout } = createPollTimeout(
         timeoutMs,
         logger,
         params.flowId
       );
       const abortSignal = params.abortSignal || controller.signal;
+      // Check both signals: external abortSignal and internal controller.signal (for timeout)
+      const isAborted = () => abortSignal.aborted || controller.signal.aborted;
 
       const deadline = Date.now() + timeoutMs;
       let nextHeight = params.startHeight;
@@ -343,7 +379,7 @@ export function createNoblePoller(
 
       try {
         while (Date.now() < deadline && (!ackFound || !cctpFound)) {
-          if (abortSignal.aborted) break;
+          if (isAborted()) break;
 
           const latest = await rpcClient.getLatestBlockHeight();
           logger.debug(
@@ -352,18 +388,27 @@ export function createNoblePoller(
           );
 
           while (nextHeight <= latest && (!ackFound || !cctpFound)) {
-            if (abortSignal.aborted) break;
+            if (isAborted()) break;
 
             onUpdate?.({ height: nextHeight, ackFound, cctpFound });
 
             try {
-              const blockResults = await rpcClient.getBlockResults(nextHeight);
+              // Retry with exponential backoff for transient errors
+              const blockResults = await retryWithBackoff(
+                () => rpcClient.getBlockResults(nextHeight),
+                3, // max retries
+                500, // initial delay 500ms
+                5000 // max delay 5s
+              );
+              
               if (!blockResults) {
                 logger.debug(
                   { flowId: params.flowId, height: nextHeight },
                   'Noble orbiter poll: no block results for height'
                 );
                 nextHeight++;
+                // Add delay before next block request
+                await sleep(blockRequestDelayMs);
                 continue;
               }
               const txs = blockResults.txs_results || [];
@@ -445,13 +490,31 @@ export function createNoblePoller(
                 }
               }
             } catch (error) {
+              // Check if error is permanent (404 = block doesn't exist)
+              if (isPermanentError(error)) {
+                logger.debug(
+                  { err: error, flowId: params.flowId, height: nextHeight },
+                  'Noble orbiter poll: permanent error for height, skipping'
+                );
+                nextHeight++;
+                await sleep(blockRequestDelayMs);
+                continue;
+              }
+              
+              // Transient errors should have been retried by retryWithBackoff
+              // If we still get here, log warning and skip block after max retries
               logger.warn(
                 { err: error, flowId: params.flowId, height: nextHeight },
-                'Noble orbiter poll fetch failed for height'
+                'Noble orbiter poll fetch failed for height after retries, skipping block'
               );
+              nextHeight++;
+              await sleep(blockRequestDelayMs);
+              continue;
             }
 
             nextHeight++;
+            // Add delay before next block request to avoid rate limiting
+            await sleep(blockRequestDelayMs);
           }
 
           if (ackFound && cctpFound) break;

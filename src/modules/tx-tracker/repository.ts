@@ -51,7 +51,7 @@ export interface TxTrackerRepository {
 type TrackedTransactionModel = Prisma.TrackedTransactionGetPayload<Record<string, unknown>>;
 
 const DEFAULT_STATUS = 'pending';
-const FINISHED_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+const FINISHED_STATUSES = new Set(['completed', 'failed', 'cancelled', 'undetermined']);
 
 export function createTxTrackerRepository(prisma: PrismaClient): TxTrackerRepository {
   return {

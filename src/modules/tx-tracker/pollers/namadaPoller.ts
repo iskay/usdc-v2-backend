@@ -7,6 +7,9 @@ import {
   sleep,
   createPollTimeout,
   indexAttributes,
+  retryWithBackoff,
+  isTransientError,
+  isPermanentError,
 } from './base.js';
 
 export interface NamadaPollParams extends PollParams {
@@ -37,12 +40,15 @@ export function createNamadaPoller(
     async pollForDeposit(params, onUpdate) {
       const timeoutMs = params.timeoutMs ?? 30 * 60 * 1000;
       const intervalMs = params.intervalMs ?? 5000;
-      const { controller, cleanup } = createPollTimeout(
+      const blockRequestDelayMs = params.blockRequestDelayMs ?? 100;
+      const { controller, cleanup, wasTimeout } = createPollTimeout(
         timeoutMs,
         logger,
         params.flowId
       );
       const abortSignal = params.abortSignal || controller.signal;
+      // Check both signals: external abortSignal and internal controller.signal (for timeout)
+      const isAborted = () => abortSignal.aborted || controller.signal.aborted;
 
       const deadline = Date.now() + timeoutMs;
       let nextHeight = params.startHeight;
@@ -67,7 +73,7 @@ export function createNamadaPoller(
 
       try {
         while (Date.now() < deadline && !ackFound) {
-          if (abortSignal.aborted) break;
+          if (isAborted()) break;
 
           const latest = await rpcClient.getLatestBlockHeight();
           logger.debug(
@@ -76,18 +82,27 @@ export function createNamadaPoller(
           );
 
           while (nextHeight <= latest && !ackFound) {
-            if (abortSignal.aborted) break;
+            if (isAborted()) break;
 
             onUpdate?.({ height: nextHeight, ackFound });
 
             try {
-              const blockResults = await rpcClient.getBlockResults(nextHeight);
+              // Retry with exponential backoff for transient errors
+              const blockResults = await retryWithBackoff(
+                () => rpcClient.getBlockResults(nextHeight),
+                3, // max retries
+                500, // initial delay 500ms
+                5000 // max delay 5s
+              );
+              
               if (!blockResults) {
                 logger.debug(
                   { flowId: params.flowId, height: nextHeight },
                   'Namada deposit poll: no block results for height'
                 );
                 nextHeight++;
+                // Add delay before next block request
+                await sleep(blockRequestDelayMs);
                 continue;
               }
               // Access end_block_events directly from blockResults (RPC client unwraps the result)
@@ -173,13 +188,31 @@ export function createNamadaPoller(
                 }
               }
             } catch (error) {
+              // Check if error is permanent (404 = block doesn't exist)
+              if (isPermanentError(error)) {
+                logger.debug(
+                  { err: error, flowId: params.flowId, height: nextHeight },
+                  'Namada deposit poll: permanent error for height, skipping'
+                );
+                nextHeight++;
+                await sleep(blockRequestDelayMs);
+                continue;
+              }
+              
+              // Transient errors should have been retried by retryWithBackoff
+              // If we still get here, log warning and skip block after max retries
               logger.warn(
                 { err: error, flowId: params.flowId, height: nextHeight },
-                'Namada deposit poll fetch failed for height'
+                'Namada deposit poll fetch failed for height after retries, skipping block'
               );
+              nextHeight++;
+              await sleep(blockRequestDelayMs);
+              continue;
             }
 
             nextHeight++;
+            // Add delay before next block request to avoid rate limiting
+            await sleep(blockRequestDelayMs);
           }
 
           if (ackFound) break;

@@ -43,7 +43,7 @@ export function createEvmPoller(
     async pollUsdcMint(params, onUpdate) {
       const timeoutMs = params.timeoutMs ?? 30 * 60 * 1000; // 30 minutes default
       const intervalMs = params.intervalMs ?? 5000; // 5 seconds default
-      const { controller, cleanup } = createPollTimeout(
+      const { controller, cleanup, wasTimeout } = createPollTimeout(
         timeoutMs,
         logger,
         params.flowId
@@ -51,6 +51,8 @@ export function createEvmPoller(
 
       // Use provided abort signal or create new one
       const abortSignal = params.abortSignal || controller.signal;
+      // Check both signals: external abortSignal and internal controller.signal (for timeout)
+      const isAborted = () => abortSignal.aborted || controller.signal.aborted;
 
       try {
         const zeroAddress = '0x0000000000000000000000000000000000000000';
@@ -65,7 +67,7 @@ export function createEvmPoller(
           );
         }
 
-        while (!abortSignal.aborted) {
+        while (!isAborted()) {
           const latest = await rpcClient.getBlockNumber();
           onUpdate?.({
             latest: Number(latest),

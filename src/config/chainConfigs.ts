@@ -5,47 +5,49 @@ export interface ChainPollingConfig {
   maxDurationMin: number; // Maximum duration to poll before timing out (minutes)
   blockWindowBackscan: number; // Number of blocks to scan backwards on startup
   pollIntervalMs: number; // Interval between poll attempts (milliseconds)
+  blockRequestDelayMs?: number; // Delay between consecutive block_results requests (milliseconds)
 }
 
 export type ChainPollingConfigs = Record<string, ChainPollingConfig>;
 
 const DEFAULT_POLLING_CONFIG: ChainPollingConfig = {
   maxDurationMin: 30,
-  blockWindowBackscan: 20,
+  blockWindowBackscan: 50,
   pollIntervalMs: 5000,
+  blockRequestDelayMs: 100, // Default 100ms delay between block requests
 };
 
 const FALLBACK_CHAIN_CONFIGS: ChainPollingConfigs = {
   // EVM chains - matching frontend evm-chains.json keys
   'sepolia': {
     maxDurationMin: 10,
-    blockWindowBackscan: 5,
+    blockWindowBackscan: 50,
     pollIntervalMs: 5000,
   },
   'base-sepolia': {
     maxDurationMin: 10,
-    blockWindowBackscan: 5,
+    blockWindowBackscan: 50,
     pollIntervalMs: 5000,
   },
   'avalanche-fuji': {
     maxDurationMin: 10,
-    blockWindowBackscan: 5,
+    blockWindowBackscan: 50,
     pollIntervalMs: 5000,
   },
   'polygon-amoy': {
     maxDurationMin: 10,
-    blockWindowBackscan: 5,
+    blockWindowBackscan: 50,
     pollIntervalMs: 5000,
   },
   // Tendermint chains
   'noble-testnet': {
-    maxDurationMin: 20,
-    blockWindowBackscan: 10,
+    maxDurationMin: 5,
+    blockWindowBackscan: 50,
     pollIntervalMs: 5000,
   },
   'namada-testnet': {
-    maxDurationMin: 15,
-    blockWindowBackscan: 5,
+    maxDurationMin: 5,
+    blockWindowBackscan: 20,
     pollIntervalMs: 5000,
   },
 };

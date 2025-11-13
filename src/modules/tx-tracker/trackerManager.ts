@@ -16,7 +16,6 @@ import type {
   TrackedTransaction,
   TxStatusUpdate,
 } from './types.js';
-import type { TendermintRpcClient } from '../../common/rpc/tendermintClient.js';
 
 export interface TrackerManager {
   startFlow(
@@ -68,6 +67,7 @@ export function createTrackerManager({
   eventEmitter = getFlowStatusEmitter(),
 }: TrackerManagerDependencies): TrackerManager {
   const activeFlows = new Map<string, AbortController>();
+  const flowTimeouts = new Map<string, { stageTimeouts: Map<string, { timeoutMs: number; startTime: number }> }>();
 
   function getPollingConfig(chainId: string): ChainPollingConfig {
     return getChainPollingConfig(chainPollingConfigs, chainId);
@@ -141,6 +141,105 @@ export function createTrackerManager({
     });
   }
 
+  /**
+   * Handle polling timeout by marking flow as 'undetermined'
+   */
+  async function handlePollingTimeout(
+    flowId: string,
+    stage: string,
+    timeoutMs: number,
+    startTime: number
+  ): Promise<void> {
+    const flow = await repository.findById(flowId);
+    if (!flow) {
+      logger.warn({ flowId }, 'Flow not found when handling timeout');
+      return;
+    }
+
+    // Check if flow already completed or failed - don't overwrite
+    if (flow.status === 'completed' || flow.status === 'failed' || flow.status === 'undetermined') {
+      logger.debug(
+        { flowId, currentStatus: flow.status, stage },
+        'Flow already resolved, skipping timeout handling'
+      );
+      return;
+    }
+
+    const elapsedMs = Date.now() - startTime;
+    const timeoutInfo = {
+      stage,
+      timeoutMs,
+      elapsedMs,
+      occurredAt: new Date().toISOString(),
+    };
+
+    logger.warn(
+      {
+        flowId,
+        stage,
+        timeoutMs,
+        elapsedMs,
+      },
+      'Polling timeout occurred, marking flow as undetermined'
+    );
+
+    // Update flow status to 'undetermined'
+    await repository.update(flowId, {
+      status: 'undetermined',
+      errorState: {
+        reason: 'timeout',
+        ...timeoutInfo,
+      },
+    });
+
+    // Add status log entry
+    await addStatusLog(flowId, stage.split('_')[0] as keyof ChainProgress, `${stage}_timeout`, 'failed', {
+      timeout: true,
+      ...timeoutInfo,
+    });
+
+    // Emit status update event
+    emitStatusUpdate({
+      flowId,
+      chain: stage.split('_')[0] as 'evm' | 'noble' | 'namada',
+      stage: `${stage}_timeout`,
+      status: 'failed',
+      message: `Polling timeout after ${elapsedMs}ms (limit: ${timeoutMs}ms)`,
+      occurredAt: new Date(),
+      source: POLLER_SOURCE,
+      metadata: timeoutInfo,
+    });
+  }
+
+  /**
+   * Check if abort was due to timeout for a specific stage
+   */
+  function isTimeoutAbort(flowId: string, stage: string): boolean {
+    const timeoutInfo = flowTimeouts.get(flowId);
+    if (!timeoutInfo) return false;
+
+    const stageTimeout = timeoutInfo.stageTimeouts.get(stage);
+    if (!stageTimeout) return false;
+
+    const elapsedMs = Date.now() - stageTimeout.startTime;
+    return elapsedMs >= stageTimeout.timeoutMs;
+  }
+
+  /**
+   * Track timeout for a polling stage
+   */
+  function trackStageTimeout(flowId: string, stage: string, timeoutMs: number): void {
+    let flowTimeout = flowTimeouts.get(flowId);
+    if (!flowTimeout) {
+      flowTimeout = { stageTimeouts: new Map() };
+      flowTimeouts.set(flowId, flowTimeout);
+    }
+    flowTimeout.stageTimeouts.set(stage, {
+      timeoutMs,
+      startTime: Date.now(),
+    });
+  }
+
   async function ensureStartBlock(
     flow: TrackedTransaction,
     chain: keyof ChainProgress,
@@ -186,6 +285,9 @@ export function createTrackerManager({
     const abortController = new AbortController();
     activeFlows.set(flow.id, abortController);
 
+    // Initialize timeout tracking for this flow
+    flowTimeouts.set(flow.id, { stageTimeouts: new Map() });
+
     try {
       logger.debug(
         {
@@ -214,6 +316,9 @@ export function createTrackerManager({
         const rpcClient = rpcFactory(evmChain) as EvmRpcClient;
         const evmPoller = createEvmPoller(rpcClient, logger);
 
+        const stageTimeoutMs = pollConfig.maxDurationMin * 60 * 1000;
+        trackStageTimeout(flow.id, 'evm_burn', stageTimeoutMs);
+
         const evmResult = await evmPoller.pollUsdcMint(
           {
             flowId: flow.id,
@@ -224,7 +329,7 @@ export function createTrackerManager({
             fromBlock: flow.chainProgress.evm.startBlock
               ? BigInt(flow.chainProgress.evm.startBlock)
               : undefined,
-            timeoutMs: pollConfig.maxDurationMin * 60 * 1000,
+            timeoutMs: stageTimeoutMs,
             intervalMs: pollConfig.pollIntervalMs,
             abortSignal: abortController.signal,
           },
@@ -241,7 +346,18 @@ export function createTrackerManager({
           }
         );
 
-        if (abortController.signal.aborted) return;
+        // Check for timeout (even if external signal isn't aborted, poller's internal timeout may have fired)
+        const evmTimeoutOccurred = isTimeoutAbort(flow.id, 'evm_burn');
+        if (abortController.signal.aborted || evmTimeoutOccurred) {
+          if (evmTimeoutOccurred) {
+            const timeoutInfo = flowTimeouts.get(flow.id);
+            const stageTimeout = timeoutInfo?.stageTimeouts.get('evm_burn');
+            if (stageTimeout) {
+              await handlePollingTimeout(flow.id, 'evm_burn', stageTimeout.timeoutMs, stageTimeout.startTime);
+            }
+          }
+          return;
+        }
 
         if (evmResult.found && evmResult.txHash) {
           await updateChainProgress(flow.id, 'evm', {
@@ -306,6 +422,9 @@ export function createTrackerManager({
           'Using start height for Noble polling'
         );
 
+        const stageTimeoutMs = pollConfig.maxDurationMin * 60 * 1000;
+        trackStageTimeout(flow.id, 'noble_deposit', stageTimeoutMs);
+
         const nobleResult = await noblePoller.pollForDeposit(
           {
             flowId: flow.id,
@@ -314,8 +433,9 @@ export function createTrackerManager({
             forwardingAddress: params.forwardingAddress,
             expectedAmountUusdc: params.expectedAmountUusdc,
             namadaReceiver: params.namadaReceiver,
-            timeoutMs: pollConfig.maxDurationMin * 60 * 1000,
+            timeoutMs: stageTimeoutMs,
             intervalMs: pollConfig.pollIntervalMs,
+            blockRequestDelayMs: pollConfig.blockRequestDelayMs,
             abortSignal: abortController.signal,
           },
           (update) => {
@@ -342,7 +462,18 @@ export function createTrackerManager({
           }
         );
 
-        if (abortController.signal.aborted) return;
+        // Check for timeout (even if external signal isn't aborted, poller's internal timeout may have fired)
+        const nobleTimeoutOccurred = isTimeoutAbort(flow.id, 'noble_deposit');
+        if (abortController.signal.aborted || nobleTimeoutOccurred) {
+          if (nobleTimeoutOccurred) {
+            const timeoutInfo = flowTimeouts.get(flow.id);
+            const stageTimeout = timeoutInfo?.stageTimeouts.get('noble_deposit');
+            if (stageTimeout) {
+              await handlePollingTimeout(flow.id, 'noble_deposit', stageTimeout.timeoutMs, stageTimeout.startTime);
+            }
+          }
+          return;
+        }
 
         if (nobleResult.receivedFound) {
           await updateChainProgress(flow.id, 'noble', {
@@ -360,8 +491,14 @@ export function createTrackerManager({
           await addStatusLog(flow.id, 'noble', 'noble_ibc_forwarded', 'confirmed');
         }
 
+        // Only throw error if results are incomplete AND it wasn't due to timeout
         if (!nobleResult.receivedFound || !nobleResult.forwardFound) {
-          throw new Error('Noble deposit tracking incomplete');
+          // Check again if timeout occurred (may have happened between checks)
+          if (!isTimeoutAbort(flow.id, 'noble_deposit')) {
+            throw new Error('Noble deposit tracking incomplete');
+          }
+          // If timeout occurred, handlePollingTimeout was already called above, just return
+          return;
         }
       } else {
         logger.warn(
@@ -404,6 +541,9 @@ export function createTrackerManager({
           'Using start height for Namada polling'
         );
 
+        const stageTimeoutMs = pollConfig.maxDurationMin * 60 * 1000;
+        trackStageTimeout(flow.id, 'namada_receive', stageTimeoutMs);
+
         const namadaResult = await namadaPoller.pollForDeposit(
           {
             flowId: flow.id,
@@ -412,8 +552,9 @@ export function createTrackerManager({
             forwardingAddress: params.forwardingAddress,
             namadaReceiver: params.namadaReceiver,
             expectedAmountUusdc: params.expectedAmountUusdc,
-            timeoutMs: pollConfig.maxDurationMin * 60 * 1000,
+            timeoutMs: stageTimeoutMs,
             intervalMs: pollConfig.pollIntervalMs,
+            blockRequestDelayMs: pollConfig.blockRequestDelayMs,
             abortSignal: abortController.signal,
           },
           (update) => {
@@ -431,7 +572,18 @@ export function createTrackerManager({
           }
         );
 
-        if (abortController.signal.aborted) return;
+        // Check for timeout (even if external signal isn't aborted, poller's internal timeout may have fired)
+        const namadaTimeoutOccurred = isTimeoutAbort(flow.id, 'namada_receive');
+        if (abortController.signal.aborted || namadaTimeoutOccurred) {
+          if (namadaTimeoutOccurred) {
+            const timeoutInfo = flowTimeouts.get(flow.id);
+            const stageTimeout = timeoutInfo?.stageTimeouts.get('namada_receive');
+            if (stageTimeout) {
+              await handlePollingTimeout(flow.id, 'namada_receive', stageTimeout.timeoutMs, stageTimeout.startTime);
+            }
+          }
+          return;
+        }
 
         logger.debug(
           {
@@ -484,25 +636,57 @@ export function createTrackerManager({
         );
       }
     } catch (error) {
-      logger.error({ err: error, flowId: flow.id }, 'Deposit flow tracking error');
-      await repository.update(flow.id, {
-        status: 'failed',
-        errorState: {
-          error: error instanceof Error ? error.message : String(error),
-          occurredAt: new Date().toISOString(),
-        },
-      });
-      emitStatusUpdate({
-        flowId: flow.id,
-        chain: 'evm', // Default to initial chain
-        stage: 'failed',
-        status: 'failed',
-        message: error instanceof Error ? error.message : String(error),
-        occurredAt: new Date(),
-        source: POLLER_SOURCE,
-      });
+      // Check current status before overwriting - preserve 'undetermined' status
+      const currentFlow = await repository.findById(flow.id);
+      const currentStatus = currentFlow?.status;
+      
+      // Determine if this is a timeout-related error
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const isTimeoutError = errorMessage.includes('timeout') || errorMessage.includes('incomplete');
+      
+      // Use appropriate log level: WARN for timeout/expected errors, ERROR for unexpected failures
+      if (isTimeoutError && currentStatus === 'undetermined') {
+        logger.warn(
+          { flowId: flow.id, error: errorMessage },
+          'Deposit flow tracking timeout (already marked as undetermined)'
+        );
+        // Don't overwrite 'undetermined' status
+        return;
+      }
+      
+      // Only set to 'failed' if status is still 'pending' (not already 'undetermined' or 'completed')
+      if (currentStatus !== 'undetermined' && currentStatus !== 'completed') {
+        const logLevel = isTimeoutError ? 'warn' : 'error';
+        logger[logLevel](
+          { flowId: flow.id, error: errorMessage },
+          isTimeoutError ? 'Deposit flow tracking timeout' : 'Deposit flow tracking error'
+        );
+        
+        await repository.update(flow.id, {
+          status: 'failed',
+          errorState: {
+            error: errorMessage,
+            occurredAt: new Date().toISOString(),
+          },
+        });
+        emitStatusUpdate({
+          flowId: flow.id,
+          chain: 'evm', // Default to initial chain
+          stage: 'failed',
+          status: 'failed',
+          message: errorMessage,
+          occurredAt: new Date(),
+          source: POLLER_SOURCE,
+        });
+      } else {
+        logger.debug(
+          { flowId: flow.id, currentStatus, error: errorMessage },
+          'Skipping error handler - flow already resolved'
+        );
+      }
     } finally {
       activeFlows.delete(flow.id);
+      flowTimeouts.delete(flow.id);
     }
   }
 
@@ -512,6 +696,9 @@ export function createTrackerManager({
   ): Promise<void> {
     const abortController = new AbortController();
     activeFlows.set(flow.id, abortController);
+
+    // Initialize timeout tracking for this flow
+    flowTimeouts.set(flow.id, { stageTimeouts: new Map() });
 
     try {
       // Step 1: Track Namada IBC send
@@ -540,6 +727,9 @@ export function createTrackerManager({
           flow.chainProgress?.noble?.startBlock ??
           (await rpcClient.getLatestBlockHeight()) - pollConfig.blockWindowBackscan;
 
+        const stageTimeoutMs = pollConfig.maxDurationMin * 60 * 1000;
+        trackStageTimeout(flow.id, 'noble_payment', stageTimeoutMs);
+
         const nobleResult = await noblePoller.pollForOrbiter(
           {
             flowId: flow.id,
@@ -552,8 +742,9 @@ export function createTrackerManager({
             mintRecipientB64: params.mintRecipientB64,
             destinationDomain: params.destinationDomain,
             channelId: params.channelId,
-            timeoutMs: pollConfig.maxDurationMin * 60 * 1000,
+            timeoutMs: stageTimeoutMs,
             intervalMs: pollConfig.pollIntervalMs,
+            blockRequestDelayMs: pollConfig.blockRequestDelayMs,
             abortSignal: abortController.signal,
           },
           (update) => {
@@ -580,7 +771,18 @@ export function createTrackerManager({
           }
         );
 
-        if (abortController.signal.aborted) return;
+        // Check for timeout (even if external signal isn't aborted, poller's internal timeout may have fired)
+        const noblePaymentTimeoutOccurred = isTimeoutAbort(flow.id, 'noble_payment');
+        if (abortController.signal.aborted || noblePaymentTimeoutOccurred) {
+          if (noblePaymentTimeoutOccurred) {
+            const timeoutInfo = flowTimeouts.get(flow.id);
+            const stageTimeout = timeoutInfo?.stageTimeouts.get('noble_payment');
+            if (stageTimeout) {
+              await handlePollingTimeout(flow.id, 'noble_payment', stageTimeout.timeoutMs, stageTimeout.startTime);
+            }
+          }
+          return;
+        }
 
         if (nobleResult.ackFound) {
           await updateChainProgress(flow.id, 'noble', {
@@ -607,6 +809,9 @@ export function createTrackerManager({
         const rpcClient = rpcFactory(evmChain) as EvmRpcClient;
         const evmPoller = createEvmPoller(rpcClient, logger);
 
+        const stageTimeoutMs = pollConfig.maxDurationMin * 60 * 1000;
+        trackStageTimeout(flow.id, 'evm_mint', stageTimeoutMs);
+
         // TODO: Extract recipient address from base64 or params
         const evmResult = await evmPoller.pollUsdcMint(
           {
@@ -615,7 +820,7 @@ export function createTrackerManager({
             usdcAddress: params.usdcAddress || '',
             recipient: params.recipient || '',
             amountBaseUnits: params.amountBaseUnits || '0',
-            timeoutMs: pollConfig.maxDurationMin * 60 * 1000,
+            timeoutMs: stageTimeoutMs,
             intervalMs: pollConfig.pollIntervalMs,
             abortSignal: abortController.signal,
           },
@@ -632,7 +837,18 @@ export function createTrackerManager({
           }
         );
 
-        if (abortController.signal.aborted) return;
+        // Check for timeout (even if external signal isn't aborted, poller's internal timeout may have fired)
+        const evmMintTimeoutOccurred = isTimeoutAbort(flow.id, 'evm_mint');
+        if (abortController.signal.aborted || evmMintTimeoutOccurred) {
+          if (evmMintTimeoutOccurred) {
+            const timeoutInfo = flowTimeouts.get(flow.id);
+            const stageTimeout = timeoutInfo?.stageTimeouts.get('evm_mint');
+            if (stageTimeout) {
+              await handlePollingTimeout(flow.id, 'evm_mint', stageTimeout.timeoutMs, stageTimeout.startTime);
+            }
+          }
+          return;
+        }
 
         if (evmResult.found && evmResult.txHash) {
           await updateChainProgress(flow.id, 'evm', {
@@ -660,16 +876,57 @@ export function createTrackerManager({
         }
       }
     } catch (error) {
-      logger.error({ err: error, flowId: flow.id }, 'Payment flow tracking error');
-      await repository.update(flow.id, {
-        status: 'failed',
-        errorState: {
-          error: error instanceof Error ? error.message : String(error),
-          occurredAt: new Date().toISOString(),
-        },
-      });
+      // Check current status before overwriting - preserve 'undetermined' status
+      const currentFlow = await repository.findById(flow.id);
+      const currentStatus = currentFlow?.status;
+      
+      // Determine if this is a timeout-related error
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const isTimeoutError = errorMessage.includes('timeout') || errorMessage.includes('incomplete');
+      
+      // Use appropriate log level: WARN for timeout/expected errors, ERROR for unexpected failures
+      if (isTimeoutError && currentStatus === 'undetermined') {
+        logger.warn(
+          { flowId: flow.id, error: errorMessage },
+          'Payment flow tracking timeout (already marked as undetermined)'
+        );
+        // Don't overwrite 'undetermined' status
+        return;
+      }
+      
+      // Only set to 'failed' if status is still 'pending' (not already 'undetermined' or 'completed')
+      if (currentStatus !== 'undetermined' && currentStatus !== 'completed') {
+        const logLevel = isTimeoutError ? 'warn' : 'error';
+        logger[logLevel](
+          { flowId: flow.id, error: errorMessage },
+          isTimeoutError ? 'Payment flow tracking timeout' : 'Payment flow tracking error'
+        );
+        
+        await repository.update(flow.id, {
+          status: 'failed',
+          errorState: {
+            error: errorMessage,
+            occurredAt: new Date().toISOString(),
+          },
+        });
+        emitStatusUpdate({
+          flowId: flow.id,
+          chain: 'evm', // Default to initial chain
+          stage: 'failed',
+          status: 'failed',
+          message: errorMessage,
+          occurredAt: new Date(),
+          source: POLLER_SOURCE,
+        });
+      } else {
+        logger.debug(
+          { flowId: flow.id, currentStatus, error: errorMessage },
+          'Skipping error handler - flow already resolved'
+        );
+      }
     } finally {
       activeFlows.delete(flow.id);
+      flowTimeouts.delete(flow.id);
     }
   }
 

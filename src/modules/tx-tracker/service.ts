@@ -193,9 +193,14 @@ export function createTxTrackerService({
         lastCheckedAt: new Date()
       };
 
+      // Preserve 'undetermined' status - don't overwrite with calculated status
+      const currentStatus = transaction.status;
+      const calculatedStatus = determineOverallStatus(transaction.flowType ?? undefined, chainProgress);
+      const newStatus = currentStatus === 'undetermined' ? 'undetermined' : calculatedStatus;
+
       await repository.updateChainProgress(update.flowId, {
         chainProgress,
-        status: determineOverallStatus(transaction.flowType ?? undefined, chainProgress),
+        status: newStatus,
         metadata: transaction.metadata,
         errorState: transaction.errorState
       });
