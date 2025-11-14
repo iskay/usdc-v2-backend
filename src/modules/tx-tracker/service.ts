@@ -36,6 +36,7 @@ export interface TxTrackerService {
   trackFlow(input: MultiChainTrackInput): Promise<TrackedTransaction>;
   getByHash(txHash: string): Promise<TrackedTransaction | null>;
   getById(id: string): Promise<TrackedTransaction | null>;
+  getByLocalId(localId: string): Promise<TrackedTransaction | null>;
   listUnfinishedFlows(): Promise<TrackedTransaction[]>;
   appendClientStage(update: ClientStageUpdate): Promise<void>;
   getStatusLogs(flowId: string): Promise<StatusLogEntry[]>;
@@ -149,6 +150,10 @@ export function createTxTrackerService({
 
     async getById(id) {
       return repository.findById(id);
+    },
+
+    async getByLocalId(localId) {
+      return repository.findByLocalId(localId);
     },
 
     async listUnfinishedFlows() {

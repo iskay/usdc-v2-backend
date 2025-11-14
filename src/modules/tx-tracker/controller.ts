@@ -38,6 +38,10 @@ const flowIdParamsSchema = z.object({
   id: z.string().min(1)
 });
 
+const localIdParamsSchema = z.object({
+  localId: z.string().uuid('localId must be a valid UUID')
+});
+
 const chainHashParamsSchema = z.object({
   chain: z.string().min(1),
   hash: z.string().min(1)
@@ -271,6 +275,31 @@ export async function registerTxTrackerController(
         chainProgress: match.chainProgress
       }
     };
+  });
+
+  app.get('/flow/by-local-id/:localId', async (request, reply) => {
+    try {
+      const params = localIdParamsSchema.parse(request.params);
+      const result = await service.getByLocalId(params.localId);
+      
+      if (!result) {
+        return reply.code(404).send({ message: 'Flow not found for the given localId' });
+      }
+
+      return { data: serializeTrackedTransaction(result) };
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return reply.code(400).send({
+          error: 'Validation failed',
+          message: 'Invalid localId format',
+          details: error.errors.map((e) => ({
+            path: e.path.join('.'),
+            message: e.message,
+          })),
+        });
+      }
+      throw error;
+    }
   });
 
   app.get('/tx/:hash', async (request, reply) => {

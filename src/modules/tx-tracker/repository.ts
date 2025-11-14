@@ -41,6 +41,7 @@ export interface TxTrackerRepository {
   createMultiChainFlow(input: MultiChainTrackInput): Promise<TrackedTransaction>;
   findById(id: string): Promise<TrackedTransaction | null>;
   findByHash(txHash: string): Promise<TrackedTransaction | null>;
+  findByLocalId(localId: string): Promise<TrackedTransaction | null>;
   findUnfinishedFlows(): Promise<TrackedTransaction[]>;
   update(id: string, changes: Partial<TrackedTransaction>): Promise<TrackedTransaction>;
   updateChainProgress(id: string, changes: UpdateChainProgressInput): Promise<TrackedTransaction>;
@@ -82,6 +83,21 @@ export function createTxTrackerRepository(prisma: PrismaClient): TxTrackerReposi
     async findByHash(txHash) {
       const entity = await prisma.trackedTransaction.findUnique({
         where: { txHash }
+      });
+
+      return entity ? mapTrackedTransaction(entity) : null;
+    },
+
+    async findByLocalId(localId) {
+      // Query flows by localId stored in metadata JSON field
+      // Uses PostgreSQL JSONB operator: metadata->>'localId' = localId
+      const entity = await prisma.trackedTransaction.findFirst({
+        where: {
+          metadata: {
+            path: ['localId'],
+            equals: localId
+          }
+        }
       });
 
       return entity ? mapTrackedTransaction(entity) : null;
