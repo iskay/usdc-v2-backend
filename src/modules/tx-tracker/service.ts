@@ -8,6 +8,12 @@ import type { QueueManager } from '../../jobs/queue.js';
 import type { RpcClientFactory } from '../../common/rpc/index.js';
 import type { TendermintRpcClient } from '../../common/rpc/tendermintClient.js';
 import { getChainPollingConfig, type ChainPollingConfigs } from '../../config/chainConfigs.js';
+import {
+  DEPOSIT_STAGES,
+  PAYMENT_STAGES,
+  isCompletionStage,
+  getChainOrder,
+} from '../../shared/flowStages.js';
 import type {
   ChainProgress,
   ChainStage,
@@ -233,9 +239,9 @@ function cloneChainProgress(progress: ChainProgress): ChainProgress {
 }
 
 function determineOverallStatus(flowType: FlowType | undefined, progress: ChainProgress): string {
-  const chains: Array<keyof ChainProgress> = flowType === 'payment'
-    ? ['namada', 'noble', 'evm']
-    : ['evm', 'noble', 'namada'];
+  const chains = flowType === 'payment'
+    ? getChainOrder('payment')
+    : getChainOrder('deposit');
 
   for (const chain of chains) {
     const entry = progress[chain];
@@ -249,7 +255,7 @@ function determineOverallStatus(flowType: FlowType | undefined, progress: ChainP
 
   const finalEntry = progress[chains[chains.length - 1]];
   const lastStage = finalEntry?.stages?.[finalEntry.stages.length - 1];
-  if (lastStage?.stage === 'completed' || lastStage?.status === 'confirmed') {
+  if (lastStage && (isCompletionStage(lastStage.stage) || lastStage.status === 'confirmed')) {
     return 'completed';
   }
 
