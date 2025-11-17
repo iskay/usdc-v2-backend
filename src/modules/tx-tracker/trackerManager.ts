@@ -9,6 +9,7 @@ import { createEvmPoller } from './pollers/evmPoller.js';
 import { createNoblePoller } from './pollers/noblePoller.js';
 import { createNamadaPoller } from './pollers/namadaPoller.js';
 import type { TxTrackerRepository } from './repository.js';
+import type { TxTrackerService } from './service.js';
 import { getFlowStatusEmitter, type FlowStatusEventEmitter } from './events.js';
 import {
   DEPOSIT_STAGES,
@@ -55,6 +56,7 @@ export interface FlowTrackingParams {
 
 export interface TrackerManagerDependencies {
   repository: TxTrackerRepository;
+  service: TxTrackerService;
   rpcFactory: RpcClientFactory;
   chainRegistry: ChainRegistry;
   chainPollingConfigs: ChainPollingConfigs;
@@ -66,6 +68,7 @@ const POLLER_SOURCE = 'poller' as const;
 
 export function createTrackerManager({
   repository,
+  service,
   rpcFactory,
   chainRegistry: _chainRegistry,
   chainPollingConfigs,
@@ -81,6 +84,41 @@ export function createTrackerManager({
 
   function emitStatusUpdate(update: TxStatusUpdate): void {
     eventEmitter.emitStatusUpdate(update);
+  }
+
+  /**
+   * Helper function to emit status update and add stage to chainProgress.
+   * This ensures stages are persisted to the database while maintaining real-time event notifications.
+   */
+  async function emitAndAddStage(update: TxStatusUpdate): Promise<void> {
+    // Emit for real-time notifications
+    emitStatusUpdate(update);
+    
+    // Add to chainProgress stages array
+    try {
+      await service.appendClientStage({
+        flowId: update.flowId,
+        chain: update.chain,
+        stage: update.stage,
+        status: update.status,
+        txHash: update.txHash,
+        occurredAt: update.occurredAt,
+        message: update.message,
+        metadata: update.metadata,
+        source: update.source,
+      });
+    } catch (error) {
+      // Log error but don't fail the flow - stages are informational
+      logger.warn(
+        {
+          flowId: update.flowId,
+          chain: update.chain,
+          stage: update.stage,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        'Failed to add stage to chainProgress (non-fatal)'
+      );
+    }
   }
 
   async function updateChainProgress(
@@ -204,8 +242,8 @@ export function createTrackerManager({
       ...timeoutInfo,
     });
 
-    // Emit status update event
-    emitStatusUpdate({
+    // Emit status update event and add stage
+    await emitAndAddStage({
       flowId,
       chain: stage.split('_')[0] as 'evm' | 'noble' | 'namada',
       stage: `${stage}_timeout`,
@@ -294,6 +332,10 @@ export function createTrackerManager({
     // Initialize timeout tracking for this flow
     flowTimeouts.set(flow.id, { stageTimeouts: new Map() });
 
+    // Track current chain/stage for error handling context
+    let currentChain: keyof ChainProgress = 'evm'; // Default to initial chain
+    let currentStage: string = '';
+
     try {
       logger.debug(
         {
@@ -316,6 +358,8 @@ export function createTrackerManager({
         'Evaluated EVM burn polling prerequisites'
       );
       if (hasEvmPrereqs) {
+        currentChain = 'evm';
+        currentStage = 'evm_burn';
         logger.info({ flowId: flow.id }, 'Starting EVM burn tracking');
         const evmChain = flow.initialChain || flow.chain;
         const pollConfig = getPollingConfig(evmChain);
@@ -339,12 +383,12 @@ export function createTrackerManager({
             intervalMs: pollConfig.pollIntervalMs,
             abortSignal: abortController.signal,
           },
-          (update) => {
-            emitStatusUpdate({
+          async (update) => {
+            await emitAndAddStage({
               flowId: flow.id,
               chain: 'evm',
               stage: DEPOSIT_STAGES.EVM_BURN_POLLING,
-              status: 'pending',
+              status: 'confirmed',
               occurredAt: new Date(),
               source: POLLER_SOURCE,
               metadata: update,
@@ -375,7 +419,7 @@ export function createTrackerManager({
             txHash: evmResult.txHash,
             blockNumber: evmResult.blockNumber?.toString(),
           });
-          emitStatusUpdate({
+          await emitAndAddStage({
             flowId: flow.id,
             chain: 'evm',
             stage: DEPOSIT_STAGES.EVM_BURN_CONFIRMED,
@@ -411,6 +455,8 @@ export function createTrackerManager({
         'Evaluated Noble polling prerequisites'
       );
       if (hasNoblePrereqs) {
+        currentChain = 'noble';
+        currentStage = 'noble_deposit';
         logger.info({ flowId: flow.id }, 'Starting Noble tracking');
         const nobleChain = 'noble-testnet'; // Get from registry or use default
         const pollConfig = getPollingConfig(nobleChain);
@@ -432,11 +478,11 @@ export function createTrackerManager({
         trackStageTimeout(flow.id, 'noble_deposit', stageTimeoutMs);
 
         // Emit polling stage when starting Noble polling
-        emitStatusUpdate({
+        await emitAndAddStage({
           flowId: flow.id,
           chain: 'noble',
           stage: DEPOSIT_STAGES.NOBLE_POLLING,
-          status: 'pending',
+          status: 'confirmed',
           occurredAt: new Date(),
           source: POLLER_SOURCE,
         });
@@ -454,9 +500,9 @@ export function createTrackerManager({
             blockRequestDelayMs: pollConfig.blockRequestDelayMs,
             abortSignal: abortController.signal,
           },
-          (update) => {
+          async (update) => {
             if (update.receivedFound) {
-              emitStatusUpdate({
+              await emitAndAddStage({
                 flowId: flow.id,
                 chain: 'noble',
                 stage: DEPOSIT_STAGES.NOBLE_CCTP_MINTED,
@@ -466,7 +512,7 @@ export function createTrackerManager({
               });
             }
             if (update.forwardFound) {
-              emitStatusUpdate({
+              await emitAndAddStage({
                 flowId: flow.id,
                 chain: 'noble',
                 stage: DEPOSIT_STAGES.NOBLE_IBC_FORWARDED,
@@ -507,6 +553,20 @@ export function createTrackerManager({
           await addStatusLog(flow.id, 'noble', DEPOSIT_STAGES.NOBLE_IBC_FORWARDED, 'confirmed');
         }
 
+        // Check for retry exhaustion - treat as timeout
+        if (nobleResult.retryExhausted) {
+          logger.warn(
+            { flowId: flow.id },
+            'Noble deposit poll: RPC retry exhaustion detected, treating as timeout'
+          );
+          const timeoutInfo = flowTimeouts.get(flow.id);
+          const stageTimeout = timeoutInfo?.stageTimeouts.get('noble_deposit');
+          if (stageTimeout) {
+            await handlePollingTimeout(flow.id, 'noble_deposit', stageTimeout.timeoutMs, stageTimeout.startTime);
+          }
+          return;
+        }
+
         // Only throw error if results are incomplete AND it wasn't due to timeout
         if (!nobleResult.receivedFound || !nobleResult.forwardFound) {
           // Check again if timeout occurred (may have happened between checks)
@@ -539,6 +599,8 @@ export function createTrackerManager({
         'Evaluated Namada polling prerequisites'
       );
       if (hasNamadaPrereqs) {
+        currentChain = 'namada';
+        currentStage = 'namada_receive';
         logger.info({ flowId: flow.id }, 'Starting Namada tracking');
         const namadaChainId = 'namada-testnet'; // Chain ID for RPC client and polling config
         const namadaChain = 'namada' as keyof ChainProgress; // Chain key for ChainProgress
@@ -561,11 +623,11 @@ export function createTrackerManager({
         trackStageTimeout(flow.id, 'namada_receive', stageTimeoutMs);
 
         // Emit polling stage when starting Namada polling
-        emitStatusUpdate({
+        await emitAndAddStage({
           flowId: flow.id,
           chain: namadaChain,
           stage: DEPOSIT_STAGES.NAMADA_POLLING,
-          status: 'pending',
+          status: 'confirmed',
           occurredAt: new Date(),
           source: POLLER_SOURCE,
         });
@@ -583,9 +645,9 @@ export function createTrackerManager({
             blockRequestDelayMs: pollConfig.blockRequestDelayMs,
             abortSignal: abortController.signal,
           },
-          (update) => {
+          async (update) => {
             if (update.ackFound) {
-              emitStatusUpdate({
+              await emitAndAddStage({
                 flowId: flow.id,
                 chain: namadaChain,
                 stage: DEPOSIT_STAGES.NAMADA_RECEIVED,
@@ -635,7 +697,7 @@ export function createTrackerManager({
           await addStatusLog(flow.id, namadaChain, DEPOSIT_STAGES.NAMADA_RECEIVED, 'confirmed', {
             txHash: namadaResult.namadaTxHash,
           });
-          emitStatusUpdate({
+          await emitAndAddStage({
             flowId: flow.id,
             chain: 'namada',
             stage: DEPOSIT_STAGES.COMPLETED,
@@ -695,9 +757,9 @@ export function createTrackerManager({
             occurredAt: new Date().toISOString(),
           },
         });
-        emitStatusUpdate({
+        await emitAndAddStage({
           flowId: flow.id,
-          chain: 'evm', // Default to initial chain
+          chain: currentChain, // Use the chain where error occurred
           stage: DEPOSIT_STAGES.FAILED,
           status: 'failed',
           message: errorMessage,
@@ -726,6 +788,10 @@ export function createTrackerManager({
     // Initialize timeout tracking for this flow
     flowTimeouts.set(flow.id, { stageTimeouts: new Map() });
 
+    // Track current chain/stage for error handling context
+    let currentChain: keyof ChainProgress = 'namada'; // Default to initial chain for payment flow
+    let currentStage: string = '';
+
     try {
       // Step 1: Track Namada IBC send
       if (params.namadaIbcTxHash) {
@@ -743,25 +809,45 @@ export function createTrackerManager({
 
       // Step 2: Track Noble receive and CCTP burn
       if (params.memoJson && params.receiver && params.amount) {
+        currentChain = 'noble';
+        currentStage = 'noble_payment';
         logger.info({ flowId: flow.id }, 'Starting Noble payment tracking');
         const nobleChain = 'noble';
         const pollConfig = getPollingConfig(nobleChain);
         const rpcClient = rpcFactory(nobleChain) as TendermintRpcClient;
         const noblePoller = createNoblePoller(rpcClient, logger);
 
+        // Wrap getLatestBlockHeight with retry logic
+        let latestHeight: number;
+        try {
+          const { retryWithBackoff } = await import('./pollers/base.js');
+          latestHeight = await retryWithBackoff(
+            () => rpcClient.getLatestBlockHeight(),
+            3, // max retries
+            500, // initial delay 500ms
+            5000 // max delay 5s
+          );
+        } catch (error) {
+          logger.warn(
+            { err: error, flowId: flow.id },
+            'Failed to get latest block height for Noble payment flow, using fallback'
+          );
+          // Fallback: use current time-based estimate or existing startBlock
+          latestHeight = flow.chainProgress?.noble?.startBlock ?? 0;
+        }
         const startHeight =
           flow.chainProgress?.noble?.startBlock ??
-          (await rpcClient.getLatestBlockHeight()) - pollConfig.blockWindowBackscan;
+          latestHeight - pollConfig.blockWindowBackscan;
 
         const stageTimeoutMs = pollConfig.maxDurationMin * 60 * 1000;
         trackStageTimeout(flow.id, 'noble_payment', stageTimeoutMs);
 
         // Emit polling stage when starting Noble polling
-        emitStatusUpdate({
+        await emitAndAddStage({
           flowId: flow.id,
           chain: 'noble',
           stage: PAYMENT_STAGES.NOBLE_POLLING,
-          status: 'pending',
+          status: 'confirmed',
           occurredAt: new Date(),
           source: POLLER_SOURCE,
         });
@@ -783,9 +869,9 @@ export function createTrackerManager({
             blockRequestDelayMs: pollConfig.blockRequestDelayMs,
             abortSignal: abortController.signal,
           },
-          (update) => {
+          async (update) => {
             if (update.ackFound) {
-              emitStatusUpdate({
+              await emitAndAddStage({
                 flowId: flow.id,
                 chain: 'noble',
                 stage: PAYMENT_STAGES.NOBLE_RECEIVED,
@@ -795,7 +881,7 @@ export function createTrackerManager({
               });
             }
             if (update.cctpFound) {
-              emitStatusUpdate({
+              await emitAndAddStage({
                 flowId: flow.id,
                 chain: 'noble',
                 stage: PAYMENT_STAGES.NOBLE_CCTP_BURNED,
@@ -835,10 +921,26 @@ export function createTrackerManager({
           });
           await addStatusLog(flow.id, 'noble', PAYMENT_STAGES.NOBLE_CCTP_BURNED, 'confirmed');
         }
+
+        // Check for retry exhaustion - treat as timeout
+        if (nobleResult.retryExhausted) {
+          logger.warn(
+            { flowId: flow.id },
+            'Noble payment poll: RPC retry exhaustion detected, treating as timeout'
+          );
+          const timeoutInfo = flowTimeouts.get(flow.id);
+          const stageTimeout = timeoutInfo?.stageTimeouts.get('noble_payment');
+          if (stageTimeout) {
+            await handlePollingTimeout(flow.id, 'noble_payment', stageTimeout.timeoutMs, stageTimeout.startTime);
+          }
+          return;
+        }
       }
 
       // Step 3: Track EVM mint
       if (params.mintRecipientB64) {
+        currentChain = 'evm';
+        currentStage = 'evm_mint';
         logger.info({ flowId: flow.id }, 'Starting EVM mint tracking');
         const evmChain = flow.destinationChain || flow.chain; // Use destinationChain for payment flows
         const pollConfig = getPollingConfig(evmChain);
@@ -860,12 +962,12 @@ export function createTrackerManager({
             intervalMs: pollConfig.pollIntervalMs,
             abortSignal: abortController.signal,
           },
-          (update) => {
-            emitStatusUpdate({
+          async (update) => {
+            await emitAndAddStage({
               flowId: flow.id,
               chain: 'evm',
               stage: PAYMENT_STAGES.EVM_MINT_POLLING,
-              status: 'pending',
+              status: 'confirmed',
               occurredAt: new Date(),
               source: POLLER_SOURCE,
               metadata: update,
@@ -896,7 +998,16 @@ export function createTrackerManager({
             txHash: evmResult.txHash,
             blockNumber: evmResult.blockNumber?.toString(),
           });
-          emitStatusUpdate({
+          await emitAndAddStage({
+            flowId: flow.id,
+            chain: 'evm',
+            stage: PAYMENT_STAGES.EVM_MINT_CONFIRMED,
+            status: 'confirmed',
+            txHash: evmResult.txHash,
+            occurredAt: new Date(),
+            source: POLLER_SOURCE,
+          });
+          await emitAndAddStage({
             flowId: flow.id,
             chain: 'evm',
             stage: PAYMENT_STAGES.COMPLETED,
@@ -945,9 +1056,9 @@ export function createTrackerManager({
             occurredAt: new Date().toISOString(),
           },
         });
-        emitStatusUpdate({
+        await emitAndAddStage({
           flowId: flow.id,
-          chain: 'evm', // Default to initial chain
+          chain: currentChain, // Use the chain where error occurred
           stage: PAYMENT_STAGES.FAILED,
           status: 'failed',
           message: errorMessage,

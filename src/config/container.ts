@@ -75,9 +75,10 @@ export async function createAppContainer(config: AppConfig): Promise<AppContaine
     rpcClientFactory: asFunction(({ chainRegistry: registry }) => createRpcClientFactory(registry)).singleton(),
     queueManager: asFunction(({ config: cfg, logger: log }) => createQueueManager(cfg, log)).singleton(),
     txTrackerRepository: asFunction(({ prisma }) => createTxTrackerRepository(prisma)).singleton(),
-    trackerManager: asFunction(({ txTrackerRepository, rpcClientFactory, chainRegistry: registry, chainPollingConfigs, logger }) =>
+    trackerManager: asFunction(({ txTrackerRepository, txTrackerService, rpcClientFactory, chainRegistry: registry, chainPollingConfigs, logger }) =>
       createTrackerManager({
         repository: txTrackerRepository,
+        service: txTrackerService,
         rpcFactory: rpcClientFactory,
         chainRegistry: registry,
         chainPollingConfigs,

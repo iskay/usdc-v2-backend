@@ -37,8 +37,35 @@ export interface NoblePollResult extends PollResult {
   forwardAt?: number;
   ackAt?: number;
   cctpAt?: number;
+  retryExhausted?: boolean; // Flag indicating RPC retry exhaustion
 }
 
+
+/**
+ * Check if an error indicates RPC retry exhaustion (ETIMEDOUT after retries)
+ */
+function isRetryExhaustionError(error: unknown): boolean {
+  if (!error) return false;
+  
+  const axiosError = error as { code?: string; message?: string; config?: { 'axios-retry'?: { retryCount?: number } } };
+  
+  // Check for ETIMEDOUT error code (network timeout)
+  if (axiosError.code === 'ETIMEDOUT') {
+    // If axios-retry config shows retries were attempted, this is retry exhaustion
+    const retryConfig = axiosError.config?.['axios-retry'];
+    if (retryConfig && retryConfig.retryCount !== undefined && retryConfig.retryCount > 0) {
+      return true;
+    }
+    // ETIMEDOUT without retry config might still be retry exhaustion (axios-retry may not expose it)
+    // Check error message for timeout indicators
+    const errorMessage = axiosError.message || '';
+    if (errorMessage.includes('timeout') || errorMessage.includes('ETIMEDOUT')) {
+      return true;
+    }
+  }
+  
+  return false;
+}
 
 export function createNoblePoller(
   rpcClient: TendermintRpcClient,
@@ -73,12 +100,35 @@ export function createNoblePoller(
       let forwardFound = false;
       let receivedAt: number | undefined;
       let forwardAt: number | undefined;
+      let retryExhausted = false;
 
       try {
         while (Date.now() < deadline && (!receivedFound || !forwardFound)) {
           if (isAborted()) break;
 
-          const latest = await rpcClient.getLatestBlockHeight();
+          // Wrap getLatestBlockHeight with retry logic for consistent error handling
+          let latest: number;
+          try {
+            latest = await retryWithBackoff(
+              () => rpcClient.getLatestBlockHeight(),
+              3, // max retries
+              500, // initial delay 500ms
+              5000 // max delay 5s
+            );
+          } catch (error) {
+            // Check if this is retry exhaustion
+            if (isRetryExhaustionError(error)) {
+              logger.warn(
+                { err: error, flowId: params.flowId },
+                'Noble deposit poll: RPC retry exhaustion detected'
+              );
+              retryExhausted = true;
+              // Re-throw to be caught by outer catch block
+              throw error;
+            }
+            // Re-throw other errors
+            throw error;
+          }
           logger.debug(
             { flowId: params.flowId, latest, nextHeight },
             'Noble deposit poll progress'
@@ -344,13 +394,24 @@ export function createNoblePoller(
           forwardFound,
           receivedAt,
           forwardAt,
+          retryExhausted: false,
         };
       } catch (error) {
-        logger.error({ err: error, flowId: params.flowId }, 'Noble deposit poll error');
+        // Check if this is retry exhaustion
+        const isRetryExhaustion = isRetryExhaustionError(error);
+        if (isRetryExhaustion) {
+          logger.warn(
+            { err: error, flowId: params.flowId },
+            'Noble deposit poll: RPC retry exhaustion (treating as timeout)'
+          );
+        } else {
+          logger.error({ err: error, flowId: params.flowId }, 'Noble deposit poll error');
+        }
         return {
           success: false,
           found: false,
           error: error instanceof Error ? error.message : String(error),
+          retryExhausted: isRetryExhaustion,
         };
       } finally {
         cleanup();
@@ -376,12 +437,35 @@ export function createNoblePoller(
       let cctpFound = false;
       let ackAt: number | undefined;
       let cctpAt: number | undefined;
+      let retryExhausted = false;
 
       try {
         while (Date.now() < deadline && (!ackFound || !cctpFound)) {
           if (isAborted()) break;
 
-          const latest = await rpcClient.getLatestBlockHeight();
+          // Wrap getLatestBlockHeight with retry logic for consistent error handling
+          let latest: number;
+          try {
+            latest = await retryWithBackoff(
+              () => rpcClient.getLatestBlockHeight(),
+              3, // max retries
+              500, // initial delay 500ms
+              5000 // max delay 5s
+            );
+          } catch (error) {
+            // Check if this is retry exhaustion
+            if (isRetryExhaustionError(error)) {
+              logger.warn(
+                { err: error, flowId: params.flowId },
+                'Noble orbiter poll: RPC retry exhaustion detected'
+              );
+              retryExhausted = true;
+              // Re-throw to be caught by outer catch block
+              throw error;
+            }
+            // Re-throw other errors
+            throw error;
+          }
           logger.debug(
             { flowId: params.flowId, latest, nextHeight },
             'Noble orbiter poll progress'
@@ -528,13 +612,24 @@ export function createNoblePoller(
           cctpFound,
           ackAt,
           cctpAt,
+          retryExhausted: false,
         };
       } catch (error) {
-        logger.error({ err: error, flowId: params.flowId }, 'Noble orbiter poll error');
+        // Check if this is retry exhaustion
+        const isRetryExhaustion = isRetryExhaustionError(error);
+        if (isRetryExhaustion) {
+          logger.warn(
+            { err: error, flowId: params.flowId },
+            'Noble orbiter poll: RPC retry exhaustion (treating as timeout)'
+          );
+        } else {
+          logger.error({ err: error, flowId: params.flowId }, 'Noble orbiter poll error');
+        }
         return {
           success: false,
           found: false,
           error: error instanceof Error ? error.message : String(error),
+          retryExhausted: isRetryExhaustion,
         };
       } finally {
         cleanup();

@@ -41,7 +41,7 @@ const FALLBACK_CHAIN_CONFIGS: ChainPollingConfigs = {
   },
   // Tendermint chains
   'noble-testnet': {
-    maxDurationMin: 5,
+    maxDurationMin: 10,
     blockWindowBackscan: 50,
     pollIntervalMs: 5000,
   },
