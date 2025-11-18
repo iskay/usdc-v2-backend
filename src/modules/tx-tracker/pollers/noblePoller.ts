@@ -471,6 +471,20 @@ export function createNoblePoller(
             'Noble orbiter poll progress'
           );
 
+          // If nextHeight is ahead of latest, fail early (especially useful in tests)
+          if (nextHeight > latest) {
+            logger.warn(
+              { flowId: params.flowId, nextHeight, latest },
+              'Noble orbiter poll: nextHeight exceeds latest block height, stopping'
+            );
+            return {
+              success: false,
+              found: false,
+              error: `Polling exceeded latest block height: nextHeight=${nextHeight}, latest=${latest}`,
+              retryExhausted: false,
+            };
+          }
+
           while (nextHeight <= latest && (!ackFound || !cctpFound)) {
             if (isAborted()) break;
 
@@ -548,17 +562,19 @@ export function createNoblePoller(
                   if (!cctpFound && ev?.type === 'circle.cctp.v1.DepositForBurn') {
                     const attrs = indexAttributes(ev.attributes);
                     const amount = stripQuotes(attrs['amount']);
-                    const destCaller = stripQuotes(attrs['destination_caller']);
+                    const destCaller = stripQuotes(attrs['destination_caller']) || '';
                     const mintRecipient = stripQuotes(attrs['mint_recipient']);
                     const destDomain = attrs['destination_domain'];
 
+                    // Handle null/undefined destinationCallerB64 (when destination_caller is null in memo)
+                    const expectedDestCaller = params.destinationCallerB64 ?? '';
+
                     if (
                       params.amount &&
-                      params.destinationCallerB64 &&
                       params.mintRecipientB64 &&
-                      params.destinationDomain &&
+                      params.destinationDomain !== undefined &&
                       amount === params.amount &&
-                      destCaller === params.destinationCallerB64 &&
+                      destCaller === expectedDestCaller &&
                       mintRecipient === params.mintRecipientB64 &&
                       Number(destDomain) === params.destinationDomain
                     ) {

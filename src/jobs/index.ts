@@ -17,6 +17,7 @@ export async function createJobRegistry(
   const trackerManager = container.resolve('trackerManager');
   const txTrackerRepository = container.resolve('txTrackerRepository');
   const logger = container.resolve('logger');
+  const chainRegistry = container.resolve('chainRegistry');
 
   const workerOptions: WorkerOptions = {
     connection: queueManager.connection,
@@ -30,7 +31,7 @@ export async function createJobRegistry(
   // Create worker for main transaction polling queue
   const txPollingWorker = new Worker(
     QUEUE_NAMES.TX_POLLING,
-    createTxPollingProcessor(trackerManager, txTrackerRepository, logger),
+    createTxPollingProcessor(trackerManager, txTrackerRepository, logger, chainRegistry),
     workerOptions
   );
 

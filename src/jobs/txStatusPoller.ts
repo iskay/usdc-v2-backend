@@ -3,6 +3,8 @@ import type { AppLogger } from '../common/utils/logger.js';
 import type { TrackerManager } from '../modules/tx-tracker/trackerManager.js';
 import type { TxTrackerRepository } from '../modules/tx-tracker/repository.js';
 import type { FlowTrackingParams } from '../modules/tx-tracker/trackerManager.js';
+import type { ChainRegistry } from '../config/chainRegistry.js';
+import { buildFlowTrackingParams } from '../modules/tx-tracker/params.js';
 
 export interface TxPollingJobData {
   flowId: string;
@@ -13,7 +15,8 @@ export interface TxPollingJobData {
 export function createTxPollingProcessor(
   trackerManager: TrackerManager,
   repository: TxTrackerRepository,
-  logger: AppLogger
+  logger: AppLogger,
+  chainRegistry?: ChainRegistry
 ) {
   return async (job: Job<TxPollingJobData>) => {
     const { flowId, params } = job.data;
@@ -42,9 +45,31 @@ export function createTxPollingProcessor(
         return { success: true, skipped: true };
       }
 
+      // Rebuild params from flow metadata to ensure we have the latest/complete params
+      // This is important because job params might be stale or incomplete
+      // Pass chainRegistry to allow reconstruction of memoJson from destinationChain
+      const flowParams = buildFlowTrackingParams(flow, chainRegistry);
+      logger.debug(
+        {
+          flowId,
+          flowType: flow.flowType,
+          metadataKeys: flow.metadata ? Object.keys(flow.metadata as Record<string, unknown>) : [],
+          metadataSample: flow.metadata
+            ? {
+                memoJson: (flow.metadata as Record<string, unknown>).memoJson,
+                receiver: (flow.metadata as Record<string, unknown>).receiver,
+                amount: (flow.metadata as Record<string, unknown>).amount,
+              }
+            : null,
+          paramsFromJob: params,
+          paramsFromFlow: flowParams,
+        },
+        'Rebuilt tracking params from flow metadata'
+      );
+
       // Start tracking via TrackerManager
       logger.debug({ flowId }, 'Invoking trackerManager.startFlow');
-      await trackerManager.startFlow(flow, params);
+      await trackerManager.startFlow(flow, flowParams);
 
       logger.info({ flowId, jobId: job.id }, 'Transaction polling job completed');
       return { success: true };

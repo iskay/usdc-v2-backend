@@ -60,15 +60,19 @@ export function createEvmPoller(
 
         if (!fromBlock) {
           const latestBlock = await rpcClient.getBlockNumber();
-          fromBlock = latestBlock;
+          // Convert number to bigint to match toHexQuantity signature
+          // Start from one block before latest to avoid fromBlock == toBlock on first call
+          fromBlock = BigInt(latestBlock) - 1n;
           logger.debug(
-            { flowId: params.flowId, fromBlock: fromBlock.toString() },
-            'Starting EVM poll from latest block'
+            { flowId: params.flowId, fromBlock: fromBlock.toString(), latestBlock },
+            'Starting EVM poll from latest block minus one'
           );
         }
 
         while (!isAborted()) {
-          const latest = await rpcClient.getBlockNumber();
+          const latestNumber = await rpcClient.getBlockNumber();
+          // Convert number to bigint for consistency
+          const latest = BigInt(latestNumber);
           onUpdate?.({
             latest: Number(latest),
             scannedFrom: Number(fromBlock),
@@ -81,7 +85,7 @@ export function createEvmPoller(
           }
 
           // Query for Transfer events from zero address to recipient
-          const logs = await rpcClient.getLogs({
+          const getLogsParams = {
             fromBlock: toHexQuantity(fromBlock),
             toBlock: toHexQuantity(latest),
             address: params.usdcAddress,
@@ -90,7 +94,19 @@ export function createEvmPoller(
               toPaddedTopicAddress(zeroAddress),
               toPaddedTopicAddress(params.recipient),
             ],
-          });
+          };
+          logger.debug(
+            {
+              flowId: params.flowId,
+              getLogsParams,
+              fromBlock: fromBlock.toString(),
+              toBlock: latest.toString(),
+              recipient: params.recipient,
+              usdcAddress: params.usdcAddress,
+            },
+            'EVM getLogs call parameters'
+          );
+          const logs = await rpcClient.getLogs(getLogsParams);
 
           for (const log of logs) {
             // data is uint256 value (32 bytes)

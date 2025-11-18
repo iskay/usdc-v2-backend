@@ -13,6 +13,7 @@ export interface ChainRegistryEntry {
   network: 'mainnet' | 'testnet';
   displayName: string;
   rpcUrls: string[];
+  cctpDomain?: number; // CCTP domain ID for cross-chain transfers
   explorer?: {
     baseUrl: string;
     addressPath?: string;
@@ -41,6 +42,7 @@ const FALLBACK_REGISTRY: ChainRegistry = {
     network: 'testnet',
     displayName: 'Ethereum Sepolia',
     rpcUrls: ['https://sepolia.gateway.tenderly.co'],
+    cctpDomain: 0, // CCTP domain for Sepolia
     explorer: { 
       baseUrl: 'https://sepolia.etherscan.io',
       txPath: 'tx',
@@ -63,6 +65,7 @@ const FALLBACK_REGISTRY: ChainRegistry = {
     network: 'testnet',
     displayName: 'Base Sepolia',
     rpcUrls: ['https://sepolia.base.org'],
+    cctpDomain: 6, // CCTP domain for Base Sepolia
     explorer: { 
       baseUrl: 'https://sepolia.basescan.org',
       txPath: 'tx',
@@ -84,6 +87,7 @@ const FALLBACK_REGISTRY: ChainRegistry = {
     network: 'testnet',
     displayName: 'Avalanche Fuji',
     rpcUrls: ['https://api.avax-test.network/ext/bc/C/rpc'],
+    cctpDomain: 1, // CCTP domain for Avalanche Fuji
     explorer: { 
       baseUrl: 'https://subnets-test.avax.network',
       txPath: 'c-chain/tx',
@@ -104,6 +108,7 @@ const FALLBACK_REGISTRY: ChainRegistry = {
     network: 'testnet',
     displayName: 'Polygon Amoy',
     rpcUrls: ['https://rpc-amoy.polygon.technology'],
+    cctpDomain: 7, // CCTP domain for Polygon Amoy
     explorer: { 
       baseUrl: 'https://amoy.polygonscan.com',
       txPath: 'tx',
