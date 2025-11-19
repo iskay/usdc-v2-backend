@@ -47,7 +47,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-debug}
       DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/usdc_v2_backend}
       REDIS_URL: redis://redis:6379
-      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
       EVM_RPC_URLS: ${EVM_RPC_URLS:-}
       TENDERMINT_RPC_URLS: ${TENDERMINT_RPC_URLS:-}
       CHAIN_REGISTRY_PATH: ${CHAIN_REGISTRY_PATH:-}
