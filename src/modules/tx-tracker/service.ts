@@ -244,20 +244,23 @@ function determineOverallStatus(flowType: FlowType | undefined, progress: ChainP
     ? getChainOrder('payment')
     : getChainOrder('deposit');
 
+  // Check for failed stages in any chain that has entries
   for (const chain of chains) {
     const entry = progress[chain];
-    if (!entry) {
-      return 'pending';
-    }
-    if (entry.stages?.some((stage) => stage.status === 'failed')) {
+    if (entry?.stages?.some((stage) => stage.status === 'failed')) {
       return 'failed';
     }
   }
 
-  const finalEntry = progress[chains[chains.length - 1]];
-  const lastStage = finalEntry?.stages?.[finalEntry.stages.length - 1];
-  if (lastStage && isCompletionStage(lastStage.stage as FlowStage)) {
-    return 'completed';
+  // Check the final chain for completion stage
+  // Only check chains that actually exist in progress (some flows may not initialize all chains)
+  const finalChain = chains[chains.length - 1];
+  const finalEntry = progress[finalChain];
+  if (finalEntry) {
+    const lastStage = finalEntry.stages?.[finalEntry.stages.length - 1];
+    if (lastStage && isCompletionStage(lastStage.stage as FlowStage)) {
+      return 'completed';
+    }
   }
 
   return 'pending';

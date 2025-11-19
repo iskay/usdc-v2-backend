@@ -348,8 +348,12 @@ export function createTrackerManager({
         'Starting deposit flow tracking'
       );
       // Step 1: Track EVM burn
+      // NOTE: EVM polling is currently disabled to mirror payment flow behavior
+      // (payments skip Namada polling, deposits skip EVM polling)
+      // To re-enable: change hasEvmPrereqs to check actual prerequisites:
+      //   const hasEvmPrereqs = Boolean(params.evmBurnTxHash && evmProgress);
       const evmProgress = flow.chainProgress?.evm;
-      const hasEvmPrereqs = Boolean(params.evmBurnTxHash && evmProgress);
+      const hasEvmPrereqs = false; // Disabled: set to Boolean(params.evmBurnTxHash && evmProgress) to re-enable
       logger.debug(
         {
           flowId: flow.id,
@@ -697,13 +701,15 @@ export function createTrackerManager({
             { flowId: flow.id, namadaTxHash: namadaResult.namadaTxHash },
             'Updating Namada chain progress to confirmed'
           );
-          await updateChainProgress(flow.id, namadaChain, {
+          // Note: Status log and chain progress update created by emitAndAddStage below
+          await emitAndAddStage({
+            flowId: flow.id,
+            chain: 'namada',
+            stage: DEPOSIT_STAGES.NAMADA_RECEIVED,
             status: 'confirmed',
             txHash: namadaResult.namadaTxHash,
-            lastCheckedAt: new Date(),
-          });
-          await addStatusLog(flow.id, namadaChain, DEPOSIT_STAGES.NAMADA_RECEIVED, 'confirmed', {
-            txHash: namadaResult.namadaTxHash,
+            occurredAt: new Date(),
+            source: POLLER_SOURCE,
           });
           // Add COMPLETED stage - appendClientStage will automatically update flow status to 'completed'
           // via determineOverallStatus when it detects the COMPLETED stage
