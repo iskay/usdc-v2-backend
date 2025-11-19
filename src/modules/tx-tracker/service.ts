@@ -256,7 +256,7 @@ function determineOverallStatus(flowType: FlowType | undefined, progress: ChainP
 
   const finalEntry = progress[chains[chains.length - 1]];
   const lastStage = finalEntry?.stages?.[finalEntry.stages.length - 1];
-  if (lastStage && (isCompletionStage(lastStage.stage as FlowStage) || lastStage.status === 'confirmed')) {
+  if (lastStage && isCompletionStage(lastStage.stage as FlowStage)) {
     return 'completed';
   }
 

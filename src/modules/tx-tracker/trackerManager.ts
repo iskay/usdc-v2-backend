@@ -705,6 +705,8 @@ export function createTrackerManager({
           await addStatusLog(flow.id, namadaChain, DEPOSIT_STAGES.NAMADA_RECEIVED, 'confirmed', {
             txHash: namadaResult.namadaTxHash,
           });
+          // Add COMPLETED stage - appendClientStage will automatically update flow status to 'completed'
+          // via determineOverallStatus when it detects the COMPLETED stage
           await emitAndAddStage({
             flowId: flow.id,
             chain: 'namada',
@@ -714,11 +716,7 @@ export function createTrackerManager({
             occurredAt: new Date(),
             source: POLLER_SOURCE,
           });
-
-          // Mark flow as completed
-          await repository.update(flow.id, {
-            status: 'completed' as FlowStatus,
-          });
+          // Note: No need to call repository.update here - appendClientStage already handles status update
         } else {
           throw new Error('Namada receive not found');
         }
@@ -1174,12 +1172,7 @@ export function createTrackerManager({
         }
 
         if (evmResult.found && evmResult.txHash) {
-          await updateChainProgress(flow.id, 'evm', {
-            status: 'confirmed',
-            txHash: evmResult.txHash,
-            lastCheckedAt: new Date(),
-          });
-          // Note: Status log created by emitAndAddStage below (which calls appendClientStage -> addStatusLog)
+          // Note: Status log and chain progress update created by emitAndAddStage below (which calls appendClientStage)
           await emitAndAddStage({
             flowId: flow.id,
             chain: 'evm',
@@ -1192,6 +1185,8 @@ export function createTrackerManager({
               blockNumber: evmResult.blockNumber?.toString(),
             },
           });
+          // Add COMPLETED stage - appendClientStage will automatically update flow status to 'completed'
+          // via determineOverallStatus when it detects the COMPLETED stage
           await emitAndAddStage({
             flowId: flow.id,
             chain: 'evm',
@@ -1201,10 +1196,8 @@ export function createTrackerManager({
             occurredAt: new Date(),
             source: POLLER_SOURCE,
           });
-
-          await repository.update(flow.id, {
-            status: 'completed' as FlowStatus,
-          });
+          // Note: No need to call repository.update here - appendClientStage already handles status update
+          // This ensures the COMPLETED stage is fully persisted before the flow is marked as completed
         }
       }
     } catch (error) {
