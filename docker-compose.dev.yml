@@ -62,7 +62,7 @@ services:
       NOBLE_REG_CHECK_INTERVAL_MS: ${NOBLE_REG_CHECK_INTERVAL_MS:-60000}
       NOBLE_REG_STALE_MS: ${NOBLE_REG_STALE_MS:-86400000}
     ports:
-      - "${PORT:-3000}:3000"
+      - "${PORT:-3000}:${PORT:-3000}"
     volumes:
       - .:/app
       - /app/node_modules
