@@ -295,7 +295,7 @@ export function createTrackerManager({
     const currentProgress = flow.chainProgress ?? {};
     const chainEntry = currentProgress[chain];
 
-    if (chainEntry?.startBlock !== undefined) {
+    if (chainEntry?.startBlock !== undefined && chainEntry.startBlock !== null) {
       return chainEntry.startBlock;
     }
 
@@ -378,7 +378,7 @@ export function createTrackerManager({
             usdcAddress: params.usdcAddress || '',
             recipient: params.recipient || '',
             amountBaseUnits: params.amountBaseUnits || '0',
-            fromBlock: flow.chainProgress.evm.startBlock
+            fromBlock: flow.chainProgress?.evm?.startBlock != null
               ? BigInt(flow.chainProgress.evm.startBlock)
               : undefined,
             timeoutMs: stageTimeoutMs,
@@ -751,7 +751,7 @@ export function createTrackerManager({
       }
       
       // Only set to 'failed' if status is still 'pending' (not already 'undetermined' or 'completed')
-      if (!isFinalFlowStatus(currentStatus)) {
+      if (currentStatus && !isFinalFlowStatus(currentStatus)) {
         const logLevel = isTimeoutError ? 'warn' : 'error';
         logger[logLevel](
           { flowId: flow.id, error: errorMessage },
@@ -1227,7 +1227,7 @@ export function createTrackerManager({
       }
       
       // Only set to 'failed' if status is still 'pending' (not already 'undetermined' or 'completed')
-      if (!isFinalFlowStatus(currentStatus)) {
+      if (currentStatus && !isFinalFlowStatus(currentStatus)) {
         const logLevel = isTimeoutError ? 'warn' : 'error';
         logger[logLevel](
           { flowId: flow.id, error: errorMessage },

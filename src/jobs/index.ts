@@ -3,6 +3,7 @@ import type { AppContainer } from '../config/container.js';
 import type { QueueManager } from './queue.js';
 import { QUEUE_NAMES } from './queue.js';
 import { createTxPollingProcessor } from './txStatusPoller.js';
+import { createNobleForwardingCheckerProcessor } from './nobleForwardingChecker.js';
 
 export interface JobRegistry {
   queueManager: QueueManager;
@@ -18,6 +19,8 @@ export async function createJobRegistry(
   const txTrackerRepository = container.resolve('txTrackerRepository');
   const logger = container.resolve('logger');
   const chainRegistry = container.resolve('chainRegistry');
+  const config = container.resolve('config');
+  const nobleForwardingService = container.resolve('nobleForwardingService');
 
   const workerOptions: WorkerOptions = {
     connection: queueManager.connection,
@@ -47,6 +50,49 @@ export async function createJobRegistry(
   });
 
   queueManager.workers.push(txPollingWorker);
+
+  // Create worker for Noble forwarding checker (only if Noble LCD is configured)
+  if (config.nobleLcdBase) {
+    const nobleForwardingWorker = new Worker(
+      QUEUE_NAMES.NOBLE_FORWARDING_CHECKER,
+      createNobleForwardingCheckerProcessor(nobleForwardingService, config, logger),
+      {
+        ...workerOptions,
+        concurrency: 1 // Only one checker job at a time
+      }
+    );
+
+    nobleForwardingWorker.on('completed', (job) => {
+      logger.debug({ jobId: job.id }, 'Noble forwarding checker job completed');
+    });
+
+    nobleForwardingWorker.on('failed', (job, err) => {
+      logger.error({ err, jobId: job?.id }, 'Noble forwarding checker job failed');
+    });
+
+    queueManager.workers.push(nobleForwardingWorker);
+
+    // Register repeatable job for periodic checking
+    await queueManager.nobleForwardingCheckerQueue.add(
+      'check-pending-registrations',
+      {},
+      {
+        repeat: {
+          every: config.nobleRegCheckIntervalMs
+        }
+      }
+    );
+
+    logger.info(
+      {
+        intervalMs: config.nobleRegCheckIntervalMs,
+        queue: QUEUE_NAMES.NOBLE_FORWARDING_CHECKER
+      },
+      'Registered Noble forwarding checker repeatable job'
+    );
+  } else {
+    logger.warn('NOBLE_LCD_BASE not configured, skipping Noble forwarding checker job');
+  }
 
   return {
     queueManager,

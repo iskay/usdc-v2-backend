@@ -8,6 +8,7 @@ export interface QueueManager {
   evmPollingQueue: Queue;
   noblePollingQueue: Queue;
   namadaPollingQueue: Queue;
+  nobleForwardingCheckerQueue: Queue;
   workers: Worker[];
   connection: Redis;
   close(): Promise<void>;
@@ -18,6 +19,7 @@ const QUEUE_NAMES = {
   EVM_POLLING: 'evm-polling',
   NOBLE_POLLING: 'noble-polling',
   NAMADA_POLLING: 'namada-polling',
+  NOBLE_FORWARDING_CHECKER: 'noble-forwarding-checker',
 } as const;
 
 export function createQueueManager(
@@ -55,6 +57,10 @@ export function createQueueManager(
   const evmPollingQueue = new Queue(QUEUE_NAMES.EVM_POLLING, queueOptions);
   const noblePollingQueue = new Queue(QUEUE_NAMES.NOBLE_POLLING, queueOptions);
   const namadaPollingQueue = new Queue(QUEUE_NAMES.NAMADA_POLLING, queueOptions);
+  const nobleForwardingCheckerQueue = new Queue(
+    QUEUE_NAMES.NOBLE_FORWARDING_CHECKER,
+    queueOptions
+  );
 
   const workers: Worker[] = [];
 
@@ -71,6 +77,7 @@ export function createQueueManager(
     evmPollingQueue,
     noblePollingQueue,
     namadaPollingQueue,
+    nobleForwardingCheckerQueue,
     workers,
     connection,
     async close() {
@@ -81,6 +88,7 @@ export function createQueueManager(
         evmPollingQueue.close(),
         noblePollingQueue.close(),
         namadaPollingQueue.close(),
+        nobleForwardingCheckerQueue.close(),
       ]);
       await connection.quit();
       logger.info('Queues and workers closed');

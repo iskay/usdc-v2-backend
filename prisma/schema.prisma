@@ -12,6 +12,13 @@ enum FlowType {
   payment
 }
 
+enum NobleForwardingStatus {
+  pending
+  registered
+  failed
+  stale
+}
+
 model TrackedTransaction {
   id               String    @id @default(uuid())
   txHash           String    @unique
@@ -69,4 +76,25 @@ model PollCheckpoint {
   metadata  Json?
   updatedAt DateTime        @updatedAt
   createdAt DateTime        @default(now())
+}
+
+model NobleForwardingRegistration {
+  id                String                  @id @default(uuid())
+  nobleAddress      String                  @unique @map("noble_address")
+  recipient         String
+  channel           String
+  fallback          String?                 @default("")
+  status            NobleForwardingStatus   @default(pending)
+  balanceUusdc     BigInt?                 @map("balance_uusdc")
+  lastCheckedAt     DateTime?               @map("last_checked_at")
+  registeredAt      DateTime?               @map("registered_at")
+  registrationTxHash String?               @map("registration_tx_hash")
+  errorMessage      String?                 @map("error_message")
+  createdAt         DateTime                @default(now()) @map("created_at")
+  updatedAt         DateTime                @updatedAt @map("updated_at")
+
+  @@index([nobleAddress])
+  @@index([status])
+  @@index([createdAt])
+  @@map("noble_forwarding_registration")
 }

@@ -95,6 +95,15 @@ class InMemoryTxRepository implements TxTrackerRepository {
     return null;
   }
 
+  async findByLocalId(localId: string): Promise<TrackedTransaction | null> {
+    for (const flow of this.flows.values()) {
+      if (flow.metadata && typeof flow.metadata === 'object' && 'localId' in flow.metadata && flow.metadata.localId === localId) {
+        return { ...flow, metadata: flow.metadata ? { ...flow.metadata } : null };
+      }
+    }
+    return null;
+  }
+
   async findUnfinishedFlows(): Promise<TrackedTransaction[]> {
     return Array.from(this.flows.values())
       .filter((flow) => flow.status !== 'completed' && flow.status !== 'failed')
@@ -439,6 +448,7 @@ describe('Payment flow integration', () => {
       evmPollingQueue: {} as unknown as QueueManager['evmPollingQueue'],
       noblePollingQueue: {} as unknown as QueueManager['noblePollingQueue'],
       namadaPollingQueue: {} as unknown as QueueManager['namadaPollingQueue'],
+      nobleForwardingCheckerQueue: {} as unknown as QueueManager['nobleForwardingCheckerQueue'],
       workers: [],
       connection: {} as unknown as QueueManager['connection'],
       async close() {
