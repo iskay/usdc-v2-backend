@@ -1,16 +1,28 @@
 # Backend Development Commands
 
-# Start all services (backend, Postgres, Redis)
+# Start all services (backend, Postgres, Redis) - DEVELOPMENT ONLY
 up:
     docker compose -f docker-compose.dev.yml up
 
-# Start all services in detached mode
+# Start all services in detached mode - DEVELOPMENT ONLY
 up-d:
     docker compose -f docker-compose.dev.yml up -d
 
-# Stop all services
+# Start production services (backend, Postgres, Redis) - SECURE, NO EXPOSED PORTS
+up-prod:
+    docker compose -f docker-compose.yml up -d
+
+# Start production services in detached mode - SECURE, NO EXPOSED PORTS
+up-prod-d:
+    docker compose -f docker-compose.yml up -d
+
+# Stop all services (development)
 down:
     docker compose -f docker-compose.dev.yml down
+
+# Stop production services
+down-prod:
+    docker compose -f docker-compose.yml down
 
 # Stop all services and remove volumes (⚠️ deletes all data)
 down-v:

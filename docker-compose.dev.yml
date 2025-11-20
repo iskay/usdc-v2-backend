@@ -23,8 +23,10 @@ services:
   redis:
     image: redis:7-alpine
     container_name: usdc-v2-backend-redis-dev
+    # SECURITY: Bind Redis to localhost only (127.0.0.1) instead of all interfaces (0.0.0.0)
+    # This prevents Redis from being accessible from the public internet
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     volumes:
       - redis-dev-data:/data
     healthcheck:
