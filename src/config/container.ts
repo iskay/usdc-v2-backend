@@ -91,14 +91,17 @@ export async function createAppContainer(config: AppConfig): Promise<AppContaine
     rpcClientFactory: asFunction(({ chainRegistry: registry }) => createRpcClientFactory(registry)).singleton(),
     queueManager: asFunction(({ config: cfg, logger: log }) => createQueueManager(cfg, log)).singleton(),
     txTrackerRepository: asFunction(({ prisma }) => createTxTrackerRepository(prisma)).singleton(),
-    trackerManager: asFunction(({ txTrackerRepository, txTrackerService, rpcClientFactory, chainRegistry: registry, chainPollingConfigs, logger }) =>
+    trackerManager: asFunction(({ txTrackerRepository, txTrackerService, rpcClientFactory, chainRegistry: registry, chainPollingConfigs, logger, config: cfg }) =>
       createTrackerManager({
         repository: txTrackerRepository,
         service: txTrackerService,
         rpcFactory: rpcClientFactory,
         chainRegistry: registry,
         chainPollingConfigs,
-        logger
+        logger,
+        config: {
+          irisAttestationBaseURL: cfg.irisAttestationBaseURL
+        }
       })
     ).singleton(),
     txTrackerService: asFunction(({ txTrackerRepository, queueManager, logger, rpcClientFactory, chainPollingConfigs: pollingConfigs }) =>

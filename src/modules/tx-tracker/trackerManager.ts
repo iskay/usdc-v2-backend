@@ -8,6 +8,7 @@ import type { TendermintRpcClient } from '../../common/rpc/tendermintClient.js';
 import { createEvmPoller } from './pollers/evmPoller.js';
 import { createNoblePoller } from './pollers/noblePoller.js';
 import { createNamadaPoller } from './pollers/namadaPoller.js';
+import { createIrisAttestationService } from '../iris-attestation/service.js';
 import { sleep } from './pollers/base.js';
 import type { TxTrackerRepository } from './repository.js';
 import type { TxTrackerService } from './service.js';
@@ -64,6 +65,7 @@ export interface TrackerManagerDependencies {
   chainPollingConfigs: ChainPollingConfigs;
   logger: AppLogger;
   eventEmitter?: FlowStatusEventEmitter;
+  config?: { irisAttestationBaseURL?: string };
 }
 
 const POLLER_SOURCE = 'poller' as const;
@@ -76,6 +78,7 @@ export function createTrackerManager({
   chainPollingConfigs,
   logger,
   eventEmitter = getFlowStatusEmitter(),
+  config,
 }: TrackerManagerDependencies): TrackerManager {
   const activeFlows = new Map<string, AbortController>();
   const flowTimeouts = new Map<string, { stageTimeouts: Map<string, { timeoutMs: number; startTime: number }> }>();
@@ -347,107 +350,185 @@ export function createTrackerManager({
         },
         'Starting deposit flow tracking'
       );
-      // Step 1: Track EVM burn
-      // NOTE: EVM polling is currently disabled to mirror payment flow behavior
-      // (payments skip Namada polling, deposits skip EVM polling)
-      // To re-enable: change hasEvmPrereqs to check actual prerequisites:
-      //   const hasEvmPrereqs = Boolean(params.evmBurnTxHash && evmProgress);
-      const evmProgress = flow.chainProgress?.evm;
-      const hasEvmPrereqs = false; // Disabled: set to Boolean(params.evmBurnTxHash && evmProgress) to re-enable
-      logger.debug(
+      // Step 1: Extract MessageSent and poll Iris attestation API (replaces EVM polling)
+      let irisLookupID: string | undefined;
+      let irisNonce: number | undefined;
+      
+      if (!params.evmBurnTxHash) {
+        logger.warn(
+          { flowId: flow.id },
+          'No EVM transaction hash provided, cannot proceed with deposit flow'
+        );
+        throw new Error('EVM transaction hash required for deposit flow');
+      }
+
+      const evmChain = flow.initialChain || flow.chain;
+      const chainEntry = chainRegistry[evmChain];
+      const pollConfig = getPollingConfig(evmChain);
+      const irisConfig = pollConfig.iris;
+
+      // Check if iris polling is enabled for this chain
+      if (chainEntry?.chainType !== 'evm') {
+        logger.warn(
+          { flowId: flow.id, evmChain, chainType: chainEntry?.chainType },
+          'Deposit flow requires EVM chain'
+        );
+        throw new Error(`Invalid chain type for deposit flow: ${chainEntry?.chainType}`);
+      }
+
+      if (!irisConfig?.enabled) {
+        logger.warn(
+          { flowId: flow.id, evmChain },
+          'Iris polling not enabled for this chain, cannot proceed with deposit flow'
+        );
+        throw new Error(`Iris polling not enabled for chain: ${evmChain}`);
+      }
+
+      currentChain = 'evm';
+      currentStage = 'iris_attestation';
+      
+      logger.info(
+        { flowId: flow.id, evmChain, evmBurnTxHash: params.evmBurnTxHash },
+        'Starting Iris attestation polling (replacing EVM polling)'
+      );
+
+      const evmRpcClient = rpcFactory(evmChain) as EvmRpcClient;
+      const irisService = createIrisAttestationService({
+        chainRegistry,
+        logger,
+        attestationBaseURL: config?.irisAttestationBaseURL,
+      });
+
+      // Extract MessageSent event and compute IrisLookupID
+      const extractionResult = await irisService.extractMessageSent(
+        params.evmBurnTxHash,
+        evmChain,
+        evmRpcClient
+      );
+
+      if (!extractionResult.success || !extractionResult.data) {
+        logger.error(
+          {
+            flowId: flow.id,
+            error: extractionResult.error,
+            evmBurnTxHash: params.evmBurnTxHash,
+          },
+          'Failed to extract MessageSent event from transaction receipt'
+        );
+        throw new Error(`Failed to extract MessageSent event: ${extractionResult.error}`);
+      }
+
+      irisLookupID = extractionResult.data.irisLookupID;
+      irisNonce = extractionResult.data.nonce;
+
+      logger.info(
         {
           flowId: flow.id,
-          hasEvmPrereqs,
-          hasEvmBurnTxHash: Boolean(params.evmBurnTxHash),
-          hasEvmProgress: Boolean(evmProgress),
+          irisLookupID,
+          nonce: irisNonce,
+          sourceDomain: extractionResult.data.sourceDomain,
+          destinationDomain: extractionResult.data.destinationDomain,
         },
-        'Evaluated EVM burn polling prerequisites'
+        'MessageSent event extracted successfully'
       );
-      if (hasEvmPrereqs) {
-        currentChain = 'evm';
-        currentStage = 'evm_burn';
-        logger.info({ flowId: flow.id }, 'Starting EVM burn tracking');
-        const evmChain = flow.initialChain || flow.chain;
-        const pollConfig = getPollingConfig(evmChain);
-        const rpcClient = rpcFactory(evmChain) as EvmRpcClient;
-        const evmPoller = createEvmPoller(rpcClient, logger);
 
-        const stageTimeoutMs = pollConfig.maxDurationMin * 60 * 1000;
-        trackStageTimeout(flow.id, 'evm_burn', stageTimeoutMs);
+      // Emit EVM_BURN_CONFIRMED stage (transaction is confirmed since we can extract the event)
+      await emitAndAddStage({
+        flowId: flow.id,
+        chain: 'evm',
+        stage: DEPOSIT_STAGES.EVM_BURN_CONFIRMED,
+        status: 'confirmed',
+        txHash: params.evmBurnTxHash,
+        occurredAt: new Date(),
+        source: POLLER_SOURCE,
+        metadata: {
+          irisLookupID,
+          nonce: irisNonce,
+        },
+      });
 
-        const evmResult = await evmPoller.pollUsdcMint(
-          {
-            flowId: flow.id,
-            chain: evmChain,
-            usdcAddress: params.usdcAddress || '',
-            recipient: params.recipient || '',
-            amountBaseUnits: params.amountBaseUnits || '0',
-            fromBlock: flow.chainProgress?.evm?.startBlock != null
-              ? BigInt(flow.chainProgress.evm.startBlock)
-              : undefined,
-            timeoutMs: stageTimeoutMs,
-            intervalMs: pollConfig.pollIntervalMs,
-            abortSignal: abortController.signal,
-          },
-          async (update) => {
-            await emitAndAddStage({
-              flowId: flow.id,
-              chain: 'evm',
-              stage: DEPOSIT_STAGES.EVM_BURN_POLLING,
-              status: 'confirmed',
-              occurredAt: new Date(),
-              source: POLLER_SOURCE,
-              metadata: update,
-            });
+      // Update chain progress
+      await updateChainProgress(flow.id, 'evm', {
+        status: 'confirmed',
+        txHash: params.evmBurnTxHash,
+        lastCheckedAt: new Date(),
+      });
+
+      // Emit iris polling stage
+      await emitAndAddStage({
+        flowId: flow.id,
+        chain: 'evm',
+        stage: DEPOSIT_STAGES.IRIS_ATTESTATION_POLLING,
+        status: 'confirmed',
+        occurredAt: new Date(),
+        source: POLLER_SOURCE,
+        metadata: {
+          irisLookupID,
+          nonce: irisNonce,
+        },
+      });
+
+      const irisTimeoutMs = irisConfig.timeoutMs;
+      trackStageTimeout(flow.id, 'iris_attestation', irisTimeoutMs);
+
+      // Poll iris API until attestation is complete
+      const irisResult = await irisService.pollAttestation(
+        {
+          txHash: params.evmBurnTxHash,
+          chainId: evmChain,
+          flowId: flow.id,
+          timeoutMs: irisTimeoutMs,
+          pollIntervalMs: irisConfig.pollIntervalMs,
+          requestTimeoutMs: irisConfig.requestTimeoutMs,
+          abortSignal: abortController.signal,
+        },
+        irisLookupID,
+        evmRpcClient
+      );
+
+      // Check for timeout or abort
+      const irisTimeoutOccurred = isTimeoutAbort(flow.id, 'iris_attestation');
+      if (abortController.signal.aborted || irisTimeoutOccurred) {
+        if (irisTimeoutOccurred) {
+          const timeoutInfo = flowTimeouts.get(flow.id);
+          const stageTimeout = timeoutInfo?.stageTimeouts.get('iris_attestation');
+          if (stageTimeout) {
+            await handlePollingTimeout(flow.id, 'iris_attestation', stageTimeout.timeoutMs, stageTimeout.startTime);
           }
-        );
-
-        // Check for timeout (even if external signal isn't aborted, poller's internal timeout may have fired)
-        const evmTimeoutOccurred = isTimeoutAbort(flow.id, 'evm_burn');
-        if (abortController.signal.aborted || evmTimeoutOccurred) {
-          if (evmTimeoutOccurred) {
-            const timeoutInfo = flowTimeouts.get(flow.id);
-            const stageTimeout = timeoutInfo?.stageTimeouts.get('evm_burn');
-            if (stageTimeout) {
-              await handlePollingTimeout(flow.id, 'evm_burn', stageTimeout.timeoutMs, stageTimeout.startTime);
-            }
-          }
-          return;
         }
-
-        if (evmResult.found && evmResult.txHash) {
-          await updateChainProgress(flow.id, 'evm', {
-            status: 'confirmed',
-            txHash: evmResult.txHash,
-            lastCheckedAt: new Date(),
-          });
-          // Note: Status log created by emitAndAddStage below (which calls appendClientStage -> addStatusLog)
-          await emitAndAddStage({
-            flowId: flow.id,
-            chain: 'evm',
-            stage: DEPOSIT_STAGES.EVM_BURN_CONFIRMED,
-            status: 'confirmed',
-            txHash: evmResult.txHash,
-            occurredAt: new Date(),
-            source: POLLER_SOURCE,
-            metadata: {
-              blockNumber: evmResult.blockNumber?.toString(),
-            },
-          });
-        } else {
-          throw new Error('EVM burn not found');
-        }
-      } else {
-        logger.debug(
-          {
-            flowId: flow.id,
-            reason: 'missing_prerequisites',
-            hasEvmBurnTxHash: Boolean(params.evmBurnTxHash),
-            hasEvmChainProgress: Boolean(flow.chainProgress?.evm),
-          },
-          'Skipping EVM burn polling step'
-        );
+        return;
       }
+
+      if (!irisResult.success || !irisResult.attestation) {
+        logger.error(
+          {
+            flowId: flow.id,
+            error: irisResult.error,
+            irisLookupID,
+          },
+          'Iris attestation polling failed or timed out'
+        );
+        throw new Error(`Iris attestation polling failed: ${irisResult.error}`);
+      }
+
+      logger.info(
+        { flowId: flow.id, irisLookupID },
+        'Iris attestation complete'
+      );
+
+      await emitAndAddStage({
+        flowId: flow.id,
+        chain: 'evm',
+        stage: DEPOSIT_STAGES.IRIS_ATTESTATION_COMPLETE,
+        status: 'confirmed',
+        occurredAt: new Date(),
+        source: POLLER_SOURCE,
+        metadata: {
+          irisLookupID,
+          nonce: irisNonce,
+          attestation: irisResult.attestation,
+        },
+      });
 
       // Step 2: Track Noble CCTP mint and IBC forward
       const hasNoblePrereqs = Boolean(params.forwardingAddress && params.namadaReceiver);
@@ -460,6 +541,10 @@ export function createTrackerManager({
         },
         'Evaluated Noble polling prerequisites'
       );
+      
+      // Declare nobleResult at higher scope so it's available for Namada polling
+      let nobleResult: { packetSequence?: number; receivedFound?: boolean; forwardFound?: boolean; retryExhausted?: boolean } | undefined;
+      
       if (hasNoblePrereqs) {
         currentChain = 'noble';
         currentStage = 'noble_deposit';
@@ -476,8 +561,8 @@ export function createTrackerManager({
           pollConfig.blockWindowBackscan
         );
         logger.debug(
-          { flowId: flow.id, startHeight },
-          'Using start height for Noble polling'
+          { flowId: flow.id, startHeight, cctpNonce: irisNonce },
+          'Using start height for Noble polling with CCTP nonce'
         );
 
         const stageTimeoutMs = pollConfig.maxDurationMin * 60 * 1000;
@@ -491,13 +576,16 @@ export function createTrackerManager({
           status: 'confirmed',
           occurredAt: new Date(),
           source: POLLER_SOURCE,
+          metadata: {
+            cctpNonce: irisNonce,
+          },
         });
 
         // Track which stages have been emitted to prevent duplicates
         let nobleCctpMintedEmitted = false;
         let nobleIbcForwardedEmitted = false;
 
-        const nobleResult = await noblePoller.pollForDeposit(
+        nobleResult = await noblePoller.pollForDeposit(
           {
             flowId: flow.id,
             chain: nobleChain,
@@ -505,14 +593,26 @@ export function createTrackerManager({
             forwardingAddress: params.forwardingAddress,
             expectedAmountUusdc: params.expectedAmountUusdc,
             namadaReceiver: params.namadaReceiver,
+            cctpNonce: irisNonce, // Pass CCTP nonce extracted from MessageSent event
             timeoutMs: stageTimeoutMs,
             intervalMs: pollConfig.pollIntervalMs,
             blockRequestDelayMs: pollConfig.blockRequestDelayMs,
             abortSignal: abortController.signal,
           },
           async (update) => {
+            logger.debug(
+              {
+                flowId: flow.id,
+                receivedFound: update.receivedFound,
+                forwardFound: update.forwardFound,
+                nobleCctpMintedEmitted,
+                nobleIbcForwardedEmitted,
+              },
+              'Noble poller onUpdate callback received'
+            );
             if (update.receivedFound && !nobleCctpMintedEmitted) {
               nobleCctpMintedEmitted = true;
+              logger.debug({ flowId: flow.id }, 'Emitting NOBLE_CCTP_MINTED stage');
               await emitAndAddStage({
                 flowId: flow.id,
                 chain: 'noble',
@@ -524,6 +624,7 @@ export function createTrackerManager({
             }
             if (update.forwardFound && !nobleIbcForwardedEmitted) {
               nobleIbcForwardedEmitted = true;
+              logger.debug({ flowId: flow.id }, 'Emitting NOBLE_IBC_FORWARDED stage');
               await emitAndAddStage({
                 flowId: flow.id,
                 chain: 'noble',
@@ -644,11 +745,15 @@ export function createTrackerManager({
           source: POLLER_SOURCE,
         });
 
+        // Track which stages have been emitted to prevent duplicates
+        let namadaReceivedEmitted = false;
+
         const namadaResult = await namadaPoller.pollForDeposit(
           {
             flowId: flow.id,
             chain: namadaChainId,
             startHeight,
+            packetSequence: nobleResult?.packetSequence, // Pass packet sequence from Noble polling result
             forwardingAddress: params.forwardingAddress,
             namadaReceiver: params.namadaReceiver,
             expectedAmountUusdc: params.expectedAmountUusdc,
@@ -658,7 +763,9 @@ export function createTrackerManager({
             abortSignal: abortController.signal,
           },
           async (update) => {
-            if (update.ackFound) {
+            if (update.ackFound && !namadaReceivedEmitted) {
+              namadaReceivedEmitted = true;
+              logger.debug({ flowId: flow.id }, 'Emitting NAMADA_RECEIVED stage');
               await emitAndAddStage({
                 flowId: flow.id,
                 chain: namadaChain,
@@ -701,16 +808,20 @@ export function createTrackerManager({
             { flowId: flow.id, namadaTxHash: namadaResult.namadaTxHash },
             'Updating Namada chain progress to confirmed'
           );
-          // Note: Status log and chain progress update created by emitAndAddStage below
-          await emitAndAddStage({
-            flowId: flow.id,
-            chain: 'namada',
-            stage: DEPOSIT_STAGES.NAMADA_RECEIVED,
-            status: 'confirmed',
-            txHash: namadaResult.namadaTxHash,
-            occurredAt: new Date(),
-            source: POLLER_SOURCE,
-          });
+          // Note: Status log already created by emitAndAddStage in callback (if ackFound was true)
+          // Only emit stage if it wasn't already emitted via callback
+          if (!namadaReceivedEmitted) {
+            logger.debug({ flowId: flow.id }, 'Emitting NAMADA_RECEIVED stage (fallback - not emitted in callback)');
+            await emitAndAddStage({
+              flowId: flow.id,
+              chain: 'namada',
+              stage: DEPOSIT_STAGES.NAMADA_RECEIVED,
+              status: 'confirmed',
+              txHash: namadaResult.namadaTxHash,
+              occurredAt: new Date(),
+              source: POLLER_SOURCE,
+            });
+          }
           // Add COMPLETED stage - appendClientStage will automatically update flow status to 'completed'
           // via determineOverallStatus when it detects the COMPLETED stage
           await emitAndAddStage({

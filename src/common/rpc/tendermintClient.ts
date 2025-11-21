@@ -94,14 +94,61 @@ export function buildClient(http: AxiosInstance): TendermintRpcClient {
     },
 
     async searchTransactions(query, page = 1, perPage = 30) {
-      const params = new URLSearchParams({
-        query,
-        page: page.toString(),
-        per_page: perPage.toString(),
-        order_by: 'asc'
-      });
-      const { data } = await http.get<{ txs?: TendermintTx[] }>(`tx_search?${params.toString()}`);
-      return data.txs ?? [];
+      // Format query: wrap entire query string in double quotes
+      // Example input query: circle.cctp.v1.MessageReceived.nonce='\"704111\"'
+      // Example formatted: "circle.cctp.v1.MessageReceived.nonce='\"704111\"'"
+      const formattedQuery = `"${query}"`;
+      
+      // Manually construct the URL-encoded query parameter
+      // Format: "circle.cctp.v1.MessageReceived.nonce%3D%27\"704111\"%27"
+      // - Outer quotes are literal (not encoded in the example, but we'll encode them for HTTP)
+      // - = is encoded as %3D
+      // - ' is encoded as %27
+      // - \" stays as \" (backslash + quote, not encoded)
+      // Strategy: encode everything, then replace encoded backslashes with literal backslashes
+      let queryParam = encodeURIComponent(formattedQuery);
+      // Replace %5C (encoded backslash) with literal backslash
+      queryParam = queryParam.replace(/%5C/g, '\\');
+      
+      const url = `/tx_search?query=${queryParam}`;
+      
+      const baseURL = (http.defaults.baseURL as string) || '';
+      // For logging: properly construct the full URL
+      const baseURLWithSlash = baseURL.endsWith('/') ? baseURL.slice(0, -1) : baseURL;
+      const fullUrl = `${baseURLWithSlash}${url}`;
+      console.log(`[tx_search] Raw query string: ${query}`);
+      console.log(`[tx_search] Formatted query (with quotes): ${formattedQuery}`);
+      console.log(`[tx_search] URL-encoded query param: ${queryParam}`);
+      console.log(`[tx_search] Base URL: ${baseURL}`);
+      console.log(`[tx_search] Request path: ${url}`);
+      console.log(`[tx_search] Full URL: ${fullUrl}`);
+      try {
+        const response = await http.get<{ txs?: TendermintTx[]; total_count?: string; result?: { txs?: TendermintTx[]; total_count?: string } }>(url);
+        console.log(`[tx_search] Response status: ${response.status}`);
+        console.log(`[tx_search] Response data keys:`, Object.keys(response.data || {}));
+        console.log(`[tx_search] Full response data:`, JSON.stringify(response.data, null, 2));
+        
+        // Handle different response structures
+        const txs = response.data?.txs || response.data?.result?.txs || [];
+        console.log(`[tx_search] Extracted transactions: ${txs.length}`);
+        if (txs.length > 0) {
+          console.log(`[tx_search] First transaction:`, {
+            hash: txs[0].hash,
+            height: txs[0].height,
+            hasTxResult: !!(txs[0] as any).tx_result,
+            hasResult: !!(txs[0] as any).result,
+          });
+        }
+        
+        return txs;
+      } catch (error: any) {
+        console.error(`[tx_search] Request failed`);
+        console.error(`[tx_search] Error status: ${error?.response?.status}`);
+        console.error(`[tx_search] Error message: ${error?.message}`);
+        console.error(`[tx_search] Error data:`, JSON.stringify(error?.response?.data, null, 2));
+        console.error(`[tx_search] Request URL was: ${fullUrl}`);
+        throw error;
+      }
     },
 
     async getBlockResults(height) {

@@ -19,7 +19,9 @@ const envSchema = z
     NOBLE_REG_GAS: z.coerce.number().int().min(0).default(125000),
     NOBLE_REG_FEE_UUSDC: z.coerce.number().int().min(0).default(12500),
     NOBLE_REG_CHECK_INTERVAL_MS: z.coerce.number().int().min(1000).default(60000),
-    NOBLE_REG_STALE_MS: z.coerce.number().int().min(0).default(24 * 60 * 60 * 1000)
+    NOBLE_REG_STALE_MS: z.coerce.number().int().min(0).default(24 * 60 * 60 * 1000),
+    // Iris Attestation API Configuration
+    IRIS_ATTESTATION_BASE_URL: z.string().url().optional()
   })
   .transform((value) => ({
     nodeEnv: value.NODE_ENV,
@@ -40,7 +42,8 @@ const envSchema = z
     nobleRegGas: value.NOBLE_REG_GAS,
     nobleRegFeeUusdc: value.NOBLE_REG_FEE_UUSDC,
     nobleRegCheckIntervalMs: value.NOBLE_REG_CHECK_INTERVAL_MS,
-    nobleRegStaleMs: value.NOBLE_REG_STALE_MS
+    nobleRegStaleMs: value.NOBLE_REG_STALE_MS,
+    irisAttestationBaseURL: value.IRIS_ATTESTATION_BASE_URL
   }));
 
 export type AppConfig = z.infer<typeof envSchema>;

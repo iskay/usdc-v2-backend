@@ -26,6 +26,7 @@ export interface NoblePollParams extends PollParams {
   mintRecipientB64?: string;
   destinationDomain?: number;
   channelId?: string;
+  cctpNonce?: number; // CCTP message nonce extracted from MessageSent event
 }
 
 export interface NoblePollResult extends PollResult {
@@ -37,6 +38,7 @@ export interface NoblePollResult extends PollResult {
   forwardAt?: number;
   ackAt?: number;
   cctpAt?: number;
+  packetSequence?: number; // IBC packet sequence number (required for Namada polling)
   retryExhausted?: boolean; // Flag indicating RPC retry exhaustion
 }
 
@@ -67,43 +69,301 @@ function isRetryExhaustionError(error: unknown): boolean {
   return false;
 }
 
-export function createNoblePoller(
-  rpcClient: TendermintRpcClient,
-  logger: AppLogger
-): {
-  pollForDeposit: (
-    params: NoblePollParams,
-    onUpdate?: PollUpdateCallback
-  ) => Promise<NoblePollResult>;
-  pollForOrbiter: (
-    params: NoblePollParams,
-    onUpdate?: PollUpdateCallback
-  ) => Promise<NoblePollResult>;
-} {
-  return {
-    async pollForDeposit(params, onUpdate) {
-      const timeoutMs = params.timeoutMs ?? 30 * 60 * 1000;
-      const intervalMs = params.intervalMs ?? 5000;
-      const blockRequestDelayMs = params.blockRequestDelayMs ?? 100;
-      const { controller, cleanup, wasTimeout } = createPollTimeout(
-        timeoutMs,
-        logger,
-        params.flowId
-      );
-      const abortSignal = params.abortSignal || controller.signal;
-      // Check both signals: external abortSignal and internal controller.signal (for timeout)
-      const isAborted = () => abortSignal.aborted || controller.signal.aborted;
+/**
+ * New efficient polling approach using tx_search by nonce
+ */
+async function pollForDepositWithNonce(
+  params: NoblePollParams,
+  onUpdate?: PollUpdateCallback,
+  rpcClient?: TendermintRpcClient,
+  logger?: AppLogger
+): Promise<NoblePollResult> {
+  if (!rpcClient || !logger) {
+    throw new Error('rpcClient and logger required for pollForDepositWithNonce');
+  }
 
-      const deadline = Date.now() + timeoutMs;
-      let nextHeight = params.startHeight;
-      let receivedFound = false;
-      let forwardFound = false;
-      let receivedAt: number | undefined;
-      let forwardAt: number | undefined;
-      let retryExhausted = false;
+  const timeoutMs = params.timeoutMs ?? 30 * 60 * 1000;
+  const txSearchTimeoutMs = 2 * 60 * 1000; // 2 minutes for tx_search
+  const txSearchIntervalMs = 3000; // 3 seconds
+  const { controller, cleanup } = createPollTimeout(
+    timeoutMs,
+    logger,
+    params.flowId
+  );
+  const abortSignal = params.abortSignal || controller.signal;
+  const isAborted = () => abortSignal.aborted || controller.signal.aborted;
+
+  logger.info(
+    {
+      flowId: params.flowId,
+      cctpNonce: params.cctpNonce,
+      forwardingAddress: params.forwardingAddress,
+      expectedAmountUusdc: params.expectedAmountUusdc,
+      namadaReceiver: params.namadaReceiver,
+    },
+    'Starting Noble deposit polling with CCTP nonce (new approach)'
+  );
+
+  try {
+    // Step 1: Search for CCTP mint event by nonce using tx_search
+    // Query format: circle.cctp.v1.MessageReceived.nonce='\"<NONCE>\"'
+    // The entire query will be wrapped in double quotes by searchTransactions
+    const query = `circle.cctp.v1.MessageReceived.nonce='\\"${params.cctpNonce}\\"'`;
+    logger.debug({ flowId: params.flowId, query, cctpNonce: params.cctpNonce }, 'Searching for CCTP mint event');
+
+    const txSearchDeadline = Date.now() + txSearchTimeoutMs;
+    let cctpTx: Awaited<ReturnType<typeof rpcClient.searchTransactions>>[0] | null = null;
+    let cctpBlockHeight: number | null = null;
+
+    while (Date.now() < txSearchDeadline) {
+      if (isAborted()) {
+        return {
+          success: false,
+          found: false,
+          error: 'Polling aborted',
+        };
+      }
 
       try {
-        while (Date.now() < deadline && (!receivedFound || !forwardFound)) {
+        const txs = await rpcClient.searchTransactions(query, 1, 1);
+        
+        if (txs.length > 0) {
+          const tx = txs[0];
+          
+          // Verify the transaction has the MessageReceived event with matching nonce
+          // Handle both tx_result (from API) and result (from interface) field names
+          const txResult = (tx as any).tx_result || (tx as any).result;
+          const events = txResult?.events || [];
+          
+          let nonceMatched = false;
+          for (const event of events) {
+            if (event.type === 'circle.cctp.v1.MessageReceived') {
+              const attrs = indexAttributes(event.attributes || []);
+              const eventNonce = stripQuotes(attrs['nonce']);
+              if (eventNonce === String(params.cctpNonce)) {
+                nonceMatched = true;
+                break;
+              }
+            }
+          }
+
+          if (nonceMatched) {
+            cctpTx = tx as any;
+            cctpBlockHeight = Number.parseInt(tx.height, 10);
+            logger.info(
+              {
+                flowId: params.flowId,
+                cctpNonce: params.cctpNonce,
+                blockHeight: cctpBlockHeight,
+                txHash: tx.hash,
+              },
+              'CCTP mint event found via tx_search'
+            );
+            // Notify that CCTP mint was found
+            logger.debug(
+              { flowId: params.flowId, receivedFound: true, forwardFound: false },
+              'Calling onUpdate callback for CCTP mint'
+            );
+            await onUpdate?.({ height: cctpBlockHeight, receivedFound: true, forwardFound: false });
+            logger.debug(
+              { flowId: params.flowId },
+              'onUpdate callback completed for CCTP mint'
+            );
+            break;
+          }
+        }
+      } catch (error) {
+        logger.warn(
+          { flowId: params.flowId, err: error, query },
+          'tx_search request failed, retrying'
+        );
+      }
+
+      await sleep(txSearchIntervalMs);
+    }
+
+    if (!cctpTx || !cctpBlockHeight) {
+      return {
+        success: false,
+        found: false,
+        error: `CCTP mint event not found for nonce ${params.cctpNonce} within ${txSearchTimeoutMs}ms`,
+      };
+    }
+
+    // Step 2: Get block_results at the found height and extract IBC packet sequence
+    logger.debug(
+      { flowId: params.flowId, blockHeight: cctpBlockHeight },
+      'Fetching block_results to find IBC send_packet event'
+    );
+
+    const blockResults = await rpcClient.getBlockResults(cctpBlockHeight);
+    if (!blockResults) {
+      return {
+        success: false,
+        found: false,
+        error: `Block results not found for height ${cctpBlockHeight}`,
+      };
+    }
+
+    // Construct expected packet_data JSON
+    if (!params.expectedAmountUusdc || !params.namadaReceiver || !params.forwardingAddress) {
+      logger.warn(
+        { flowId: params.flowId },
+        'Missing required params for packet_data matching, returning CCTP mint success only'
+      );
+      // Notify that CCTP mint was found (but IBC forward cannot be verified)
+      logger.debug(
+        { flowId: params.flowId, receivedFound: true, forwardFound: false },
+        'Calling onUpdate callback for CCTP mint (early return)'
+      );
+      await onUpdate?.({ height: cctpBlockHeight, receivedFound: true, forwardFound: false });
+      logger.debug(
+        { flowId: params.flowId },
+        'onUpdate callback completed for CCTP mint (early return)'
+      );
+      return {
+        success: true,
+        found: true,
+        receivedFound: true,
+        forwardFound: false,
+        cctpAt: cctpBlockHeight,
+        receivedAt: cctpBlockHeight,
+      };
+    }
+
+    const amountValue = params.expectedAmountUusdc.replace('uusdc', '');
+    const expectedPacketData = JSON.stringify({
+      amount: amountValue,
+      denom: 'uusdc',
+      receiver: params.namadaReceiver,
+      sender: params.forwardingAddress,
+    });
+
+    logger.debug(
+      { flowId: params.flowId, expectedPacketData },
+      'Searching for send_packet event with matching packet_data'
+    );
+
+    // Search finalize_block_events for send_packet
+    const finalizeEvents = blockResults.finalize_block_events || [];
+    let packetSequence: number | undefined;
+    let forwardFound = false;
+
+    for (const event of finalizeEvents) {
+      if (event.type === 'send_packet') {
+        const packetDataAttr = event.attributes?.find(
+          attr => attr.key === 'packet_data'
+        );
+
+        if (packetDataAttr?.value === expectedPacketData) {
+          // Found matching packet
+          const packetSequenceAttr = event.attributes?.find(
+            attr => attr.key === 'packet_sequence'
+          );
+
+          if (packetSequenceAttr?.value) {
+            packetSequence = Number.parseInt(packetSequenceAttr.value, 10);
+            forwardFound = true;
+            logger.info(
+              {
+                flowId: params.flowId,
+                blockHeight: cctpBlockHeight,
+                packetSequence,
+                packetData: expectedPacketData,
+              },
+              'IBC send_packet event found with matching packet_data'
+            );
+            // Notify that IBC forward was found
+            logger.debug(
+              { flowId: params.flowId, forwardFound: true, receivedFound: true },
+              'Calling onUpdate callback for IBC forward'
+            );
+            await onUpdate?.({ height: cctpBlockHeight, receivedFound: true, forwardFound: true });
+            logger.debug(
+              { flowId: params.flowId },
+              'onUpdate callback completed for IBC forward'
+            );
+            break;
+          }
+        }
+      }
+    }
+
+    if (!forwardFound) {
+      logger.warn(
+        {
+          flowId: params.flowId,
+          blockHeight: cctpBlockHeight,
+          expectedPacketData,
+        },
+        'CCTP mint found but matching send_packet event not found in finalize_block_events'
+      );
+    }
+
+    return {
+      success: true,
+      found: true,
+      receivedFound: true,
+      forwardFound,
+      cctpAt: cctpBlockHeight,
+      receivedAt: cctpBlockHeight,
+      forwardAt: forwardFound ? cctpBlockHeight : undefined,
+      packetSequence,
+    };
+  } catch (error) {
+    logger.error(
+      { flowId: params.flowId, err: error, cctpNonce: params.cctpNonce },
+      'Noble deposit poll with nonce error'
+    );
+    return {
+      success: false,
+      found: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    cleanup();
+  }
+}
+
+/**
+ * Old iterative polling approach (fallback when cctpNonce is not provided)
+ */
+async function pollForDepositIterative(
+  params: NoblePollParams,
+  onUpdate?: PollUpdateCallback,
+  rpcClient?: TendermintRpcClient,
+  logger?: AppLogger
+): Promise<NoblePollResult> {
+  if (!rpcClient || !logger) {
+    throw new Error('rpcClient and logger required for pollForDepositIterative');
+  }
+
+  const timeoutMs = params.timeoutMs ?? 30 * 60 * 1000;
+  const intervalMs = params.intervalMs ?? 5000;
+  const blockRequestDelayMs = params.blockRequestDelayMs ?? 100;
+  const { controller, cleanup, wasTimeout } = createPollTimeout(
+    timeoutMs,
+    logger,
+    params.flowId
+  );
+  const abortSignal = params.abortSignal || controller.signal;
+  const isAborted = () => abortSignal.aborted || controller.signal.aborted;
+
+  logger.info(
+    { flowId: params.flowId },
+    'Starting Noble deposit polling (iterative approach - fallback)'
+  );
+
+  const deadline = Date.now() + timeoutMs;
+  let nextHeight = params.startHeight;
+  let receivedFound = false;
+  let forwardFound = false;
+  let receivedAt: number | undefined;
+  let forwardAt: number | undefined;
+  let retryExhausted = false;
+
+  try {
+    while (Date.now() < deadline && (!receivedFound || !forwardFound)) {
           if (isAborted()) break;
 
           // Wrap getLatestBlockHeight with retry logic for consistent error handling
@@ -416,6 +676,36 @@ export function createNoblePoller(
       } finally {
         cleanup();
       }
+}
+
+export function createNoblePoller(
+  rpcClient: TendermintRpcClient,
+  logger: AppLogger
+): {
+  pollForDeposit: (
+    params: NoblePollParams,
+    onUpdate?: PollUpdateCallback
+  ) => Promise<NoblePollResult>;
+  pollForOrbiter: (
+    params: NoblePollParams,
+    onUpdate?: PollUpdateCallback
+  ) => Promise<NoblePollResult>;
+} {
+  // Bind rpcClient and logger to helper functions
+  const pollForDepositWithNonceBound = (params: NoblePollParams, onUpdate?: PollUpdateCallback) =>
+    pollForDepositWithNonce(params, onUpdate, rpcClient, logger);
+  const pollForDepositIterativeBound = (params: NoblePollParams, onUpdate?: PollUpdateCallback) =>
+    pollForDepositIterative(params, onUpdate, rpcClient, logger);
+
+  return {
+    async pollForDeposit(params, onUpdate) {
+      // If cctpNonce is provided, use new efficient approach
+      if (params.cctpNonce !== undefined) {
+        return pollForDepositWithNonceBound(params, onUpdate);
+      }
+      
+      // Otherwise, fall back to old iterative approach
+      return pollForDepositIterativeBound(params, onUpdate);
     },
 
     async pollForOrbiter(params, onUpdate) {

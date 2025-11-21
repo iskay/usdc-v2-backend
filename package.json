@@ -24,6 +24,7 @@
   "dependencies": {
     "@fastify/cors": "^11.1.0",
     "@fastify/swagger": "^9.5.2",
+    "@noble/hashes": "^2.0.1",
     "@prisma/client": "^6.19.0",
     "@types/ws": "^8.18.1",
     "awilix": "^12.0.5",

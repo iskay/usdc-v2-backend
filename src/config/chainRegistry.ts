@@ -50,7 +50,8 @@ const FALLBACK_REGISTRY: ChainRegistry = {
     },
     contracts: {
       usdc: '0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238',
-      tokenMessenger: '0x9f3B8679c73C2Fef8b59B4f3444d4e156fb70AA5'
+      tokenMessenger: '0x9f3B8679c73C2Fef8b59B4f3444d4e156fb70AA5',
+      messageTransmitter: '0x26413e8157CD32011E726065a5462e97dD4d03D9'
     },
     gasless: {
       enabled: true,
@@ -73,7 +74,8 @@ const FALLBACK_REGISTRY: ChainRegistry = {
     },
     contracts: {
       usdc: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
-      tokenMessenger: '0x9f3B8679c73C2Fef8b59B4f3444d4e156fb70AA5'
+      tokenMessenger: '0x9f3B8679c73C2Fef8b59B4f3444d4e156fb70AA5',
+      messageTransmitter: '0x26413e8157CD32011E726065a5462e97dD4d03D9'
     },
     gasless: {
       enabled: false,
@@ -95,7 +97,8 @@ const FALLBACK_REGISTRY: ChainRegistry = {
     },
     contracts: {
       usdc: '0x5425890298aed601595a70AB815c96711a31Bc65',
-      tokenMessenger: '0xeb08f243E5d3FCFF26A9E38Ae5520A669f4019d0'
+      tokenMessenger: '0xeb08f243E5d3FCFF26A9E38Ae5520A669f4019d0',
+      messageTransmitter: '0xa9fb1b3009dcb79e2fe346c16a604b8fa8ae0a79'
     },
     gasless: {
       enabled: false
@@ -116,7 +119,8 @@ const FALLBACK_REGISTRY: ChainRegistry = {
     },
     contracts: {
       usdc: '0x41E94Eb019C0762f9Bfcf9Fb1E58725BfB0e7582',
-      tokenMessenger: '0x9f3B8679c73C2Fef8b59B4f3444d4e156fb70AA5'
+      tokenMessenger: '0x9f3B8679c73C2Fef8b59B4f3444d4e156fb70AA5',
+      messageTransmitter: '0x26413e8157CD32011E726065a5462e97dD4d03D9'
     },
     gasless: {
       enabled: false

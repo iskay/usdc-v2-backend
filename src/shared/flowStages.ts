@@ -49,8 +49,13 @@ export type StageSource = 'client' | 'poller';
  */
 export const DEPOSIT_STAGES = {
   // EVM Chain Stages
-  EVM_BURN_POLLING: 'evm_burn_polling',
+  // Note: EVM_BURN_POLLING is no longer used - replaced by IRIS_ATTESTATION_POLLING
+  // EVM_BURN_CONFIRMED is emitted immediately after extracting MessageSent from receipt
   EVM_BURN_CONFIRMED: 'evm_burn_confirmed',
+  
+  // Iris Attestation Stage (replaces EVM polling)
+  IRIS_ATTESTATION_POLLING: 'iris_attestation_polling',
+  IRIS_ATTESTATION_COMPLETE: 'iris_attestation_complete',
   
   // Noble Chain Stages
   NOBLE_POLLING: 'noble_polling',
@@ -129,8 +134,9 @@ export function getChainOrder(flowType: FlowType): readonly ChainKey[] {
  */
 export const DEPOSIT_PROGRESSION: Record<ChainKey, readonly DepositStage[]> = {
   evm: [
-    DEPOSIT_STAGES.EVM_BURN_POLLING,
     DEPOSIT_STAGES.EVM_BURN_CONFIRMED,
+    DEPOSIT_STAGES.IRIS_ATTESTATION_POLLING,
+    DEPOSIT_STAGES.IRIS_ATTESTATION_COMPLETE,
   ],
   noble: [
     DEPOSIT_STAGES.NOBLE_POLLING,
