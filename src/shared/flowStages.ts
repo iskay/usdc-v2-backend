@@ -83,7 +83,8 @@ export const DEPOSIT_STAGES = {
  */
 export const PAYMENT_STAGES = {
   // Namada Chain Stages
-  NAMADA_IBC_SENT: 'namada_ibc_sent',  // TODO: Implement tracking
+  NAMADA_POLLING: 'namada_polling',
+  NAMADA_IBC_SENT: 'namada_ibc_sent',
   
   // Noble Chain Stages
   NOBLE_POLLING: 'noble_polling',
@@ -157,6 +158,7 @@ export const DEPOSIT_PROGRESSION: Record<ChainKey, readonly DepositStage[]> = {
  */
 export const PAYMENT_PROGRESSION: Record<ChainKey, readonly PaymentStage[]> = {
   namada: [
+    PAYMENT_STAGES.NAMADA_POLLING,
     PAYMENT_STAGES.NAMADA_IBC_SENT,
   ],
   noble: [

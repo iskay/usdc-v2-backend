@@ -22,6 +22,7 @@ export interface NamadaPollParams extends PollParams {
   denom?: string;
   // Payment flow specific params
   namadaIbcTxHash?: string;
+  namadaBlockHeight?: number; // Block height where payment transaction was submitted
   memoJson?: string;
   receiver?: string;
   amount?: string;
@@ -31,8 +32,185 @@ export interface NamadaPollResult extends PollResult {
   ackFound?: boolean;
   foundAt?: number;
   namadaTxHash?: string;
+  packetSequence?: number; // IBC packet sequence (for payment flow)
 }
 
+/**
+ * Direct lookup approach for payment flow: fetch block_results at specific height
+ * and extract packet_sequence from send_packet event matching by inner-tx-hash
+ */
+async function pollForPaymentIbcSend(
+  params: NamadaPollParams,
+  onUpdate?: PollUpdateCallback,
+  rpcClient?: TendermintRpcClient,
+  logger?: AppLogger
+): Promise<NamadaPollResult> {
+  if (!rpcClient || !logger) {
+    throw new Error('rpcClient and logger required for pollForPaymentIbcSend');
+  }
+
+  const { namadaBlockHeight, namadaIbcTxHash } = params;
+
+  if (namadaBlockHeight === undefined || !namadaIbcTxHash) {
+    return {
+      success: false,
+      found: false,
+      error: 'namadaBlockHeight and namadaIbcTxHash are required',
+    };
+  }
+
+  logger.info(
+    {
+      flowId: params.flowId,
+      blockHeight: namadaBlockHeight,
+      txHash: namadaIbcTxHash,
+    },
+    'Starting Namada payment IBC send lookup'
+  );
+
+  try {
+    // Fetch block_results at the provided height
+    const blockResults = await retryWithBackoff(
+      () => rpcClient.getBlockResults(namadaBlockHeight),
+      3, // max retries
+      500, // initial delay 500ms
+      5000 // max delay 5s
+    );
+
+    if (!blockResults) {
+      logger.error(
+        { flowId: params.flowId, blockHeight: namadaBlockHeight },
+        'Block results not found at height'
+      );
+      return {
+        success: false,
+        found: false,
+        error: `Block results not found at height ${namadaBlockHeight}`,
+      };
+    }
+
+    // Access end_block_events (or finalize_block_events depending on RPC structure)
+    const endEvents = (blockResults as unknown as { 
+      end_block_events?: Array<{ 
+        type: string; 
+        attributes?: Array<{ key: string; value: string; index?: boolean }> 
+      }> 
+    }).end_block_events || [];
+
+    logger.debug(
+      { flowId: params.flowId, blockHeight: namadaBlockHeight, eventCount: endEvents.length },
+      'Searching end_block_events for send_packet event'
+    );
+
+    // Search for send_packet event matching inner-tx-hash
+    const txHashLower = namadaIbcTxHash.toLowerCase();
+    let packetSequence: number | undefined;
+
+    for (const event of endEvents) {
+      if (event?.type !== 'send_packet') continue;
+
+      const attrs = indexAttributes(event.attributes || []);
+      const innerTxHash = attrs['inner-tx-hash'];
+
+      if (!innerTxHash) continue;
+
+      // Case-insensitive comparison
+      if (innerTxHash.toLowerCase() === txHashLower) {
+        logger.debug(
+          {
+            flowId: params.flowId,
+            blockHeight: namadaBlockHeight,
+            innerTxHash,
+            txHash: namadaIbcTxHash,
+          },
+          'Found send_packet event with matching inner-tx-hash'
+        );
+
+        // Extract packet_sequence
+        const packetSeqStr = attrs['packet_sequence'];
+        if (packetSeqStr) {
+          packetSequence = Number.parseInt(packetSeqStr, 10);
+          if (!packetSequence || packetSequence <= 0) {
+            logger.error(
+              {
+                flowId: params.flowId,
+                blockHeight: namadaBlockHeight,
+                packetSeqStr,
+              },
+              'Invalid packet_sequence value'
+            );
+            return {
+              success: false,
+              found: false,
+              error: `Invalid packet_sequence: ${packetSeqStr}`,
+            };
+          }
+
+          logger.info(
+            {
+              flowId: params.flowId,
+              blockHeight: namadaBlockHeight,
+              txHash: namadaIbcTxHash,
+              packetSequence,
+            },
+            'Namada payment IBC send event found and packet_sequence extracted'
+          );
+
+          // Notify update
+          onUpdate?.({ height: namadaBlockHeight, packetSequence });
+
+          return {
+            success: true,
+            found: true,
+            packetSequence,
+            namadaTxHash: namadaIbcTxHash,
+            foundAt: namadaBlockHeight,
+          };
+        } else {
+          logger.error(
+            {
+              flowId: params.flowId,
+              blockHeight: namadaBlockHeight,
+              txHash: namadaIbcTxHash,
+            },
+            'packet_sequence attribute not found in send_packet event'
+          );
+          return {
+            success: false,
+            found: false,
+            error: 'packet_sequence attribute not found in send_packet event',
+          };
+        }
+      }
+    }
+
+    logger.warn(
+      {
+        flowId: params.flowId,
+        blockHeight: namadaBlockHeight,
+        txHash: namadaIbcTxHash,
+        eventCount: endEvents.length,
+      },
+      'No send_packet event found with matching inner-tx-hash'
+    );
+
+    return {
+      success: false,
+      found: false,
+      error: `No send_packet event found with matching inner-tx-hash ${namadaIbcTxHash} at height ${namadaBlockHeight}`,
+    };
+  } catch (error) {
+    logger.error(
+      { err: error, flowId: params.flowId, blockHeight: namadaBlockHeight },
+      'Namada payment IBC send lookup error'
+    );
+    return {
+      success: false,
+      found: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
 
 export function createNamadaPoller(
   rpcClient: TendermintRpcClient,
@@ -342,286 +520,21 @@ export function createNamadaPoller(
     },
 
     async pollForPayment(params, onUpdate) {
-      const timeoutMs = params.timeoutMs ?? 30 * 60 * 1000;
-      const intervalMs = params.intervalMs ?? 5000;
-      const blockRequestDelayMs = params.blockRequestDelayMs ?? 100;
-      const { controller, cleanup, wasTimeout } = createPollTimeout(
-        timeoutMs,
-        logger,
-        params.flowId
-      );
-      const abortSignal = params.abortSignal || controller.signal;
-      // Check both signals: external abortSignal and internal controller.signal (for timeout)
-      const isAborted = () => abortSignal.aborted || controller.signal.aborted;
-
-      const deadline = Date.now() + timeoutMs;
-      let nextHeight = params.startHeight;
-      const denom = params.denom || 'uusdc';
-      const expectedAmount = params.amount;
-      const expectedMemo = params.memoJson;
-      const expectedReceiver = params.receiver;
-      const expectedTxHash = params.namadaIbcTxHash;
-
-      let txFound = false;
-      let foundAt: number | undefined;
-      let confirmedTxHash: string | undefined;
-
-      logger.info(
-        {
-          flowId: params.flowId,
-          startHeight: params.startHeight,
-          namadaIbcTxHash: expectedTxHash,
-          receiver: expectedReceiver,
-          amount: expectedAmount,
-          memoJson: expectedMemo,
-          denom,
-        },
-        'Starting Namada payment poll'
-      );
-
-      try {
-        while (Date.now() < deadline && !txFound) {
-          if (isAborted()) break;
-
-          const latest = await rpcClient.getLatestBlockHeight();
-          logger.debug(
-            { flowId: params.flowId, latest, nextHeight },
-            'Namada payment poll progress'
-          );
-
-          // If nextHeight is ahead of latest, fail early (especially useful in tests)
-          if (nextHeight > latest) {
-            logger.warn(
-              { flowId: params.flowId, nextHeight, latest },
-              'Namada payment poll: nextHeight exceeds latest block height, stopping'
-            );
-            break;
-          }
-
-          while (nextHeight <= latest && !txFound) {
-            if (isAborted()) break;
-
-            onUpdate?.({ height: nextHeight });
-
-            try {
-              // Retry with exponential backoff for transient errors
-              const blockResults = await retryWithBackoff(
-                () => rpcClient.getBlockResults(nextHeight),
-                3, // max retries
-                500, // initial delay 500ms
-                5000 // max delay 5s
-              );
-
-              if (!blockResults) {
-                logger.debug(
-                  { flowId: params.flowId, height: nextHeight },
-                  'Namada payment poll: no block results for height'
-                );
-                nextHeight++;
-                // Add delay before next block request
-                await sleep(blockRequestDelayMs);
-                continue;
-              }
-
-              // Scan txs_results[].events[] for send_packet or ibc_transfer events
-              const txsResults = blockResults.txs_results || [];
-              for (const txResult of txsResults) {
-                // Check transaction result code (0 = success)
-                if (txResult.code !== 0) {
-                  continue; // Skip failed transactions
-                }
-
-                const events = txResult.events || [];
-                for (const ev of events) {
-                  // Check for send_packet event
-                  if (ev?.type === 'send_packet') {
-                    const attrs = indexAttributes(ev.attributes);
-                    const packetDataRaw = attrs['packet_data'];
-
-                    if (!packetDataRaw) continue;
-
-                    try {
-                      // Parse packet_data (may be JSON string or base64-encoded JSON)
-                      const parsed = parseMaybeJsonOrBase64Json(packetDataRaw) as Record<string, unknown> | undefined;
-                      if (!parsed) continue;
-
-                      const memo = parsed.memo as string | undefined;
-                      const receiver = parsed.receiver as string | undefined;
-                      const amount = parsed.amount as string | undefined;
-                      const denomFromPacket = parsed.denom as string | undefined;
-
-                      // Match memo, receiver, amount, and denom
-                      const memoMatches = expectedMemo ? memo === expectedMemo : true;
-                      const receiverMatches = expectedReceiver ? receiver === expectedReceiver : true;
-                      const denomMatches = denomFromPacket === denom;
-
-                      // Handle amount comparison - expectedAmount might include "uusdc" suffix
-                      let amountMatches = true;
-                      if (expectedAmount) {
-                        const expectedNumeric = expectedAmount.replace('uusdc', '');
-                        const actualNumeric = amount?.toString().replace('uusdc', '') || '';
-                        amountMatches = expectedNumeric === actualNumeric;
-                      }
-
-                      if (memoMatches && receiverMatches && denomMatches && amountMatches) {
-                        // Try to extract transaction hash from events
-                        // Look for transaction hash in message event or other events
-                        let txHash: string | undefined;
-                        for (const otherEv of events) {
-                          if (otherEv?.type === 'message') {
-                            const msgAttrs = indexAttributes(otherEv.attributes);
-                            const innerHash = msgAttrs['inner-tx-hash'] || msgAttrs['tx_hash'];
-                            if (innerHash) {
-                              txHash = innerHash;
-                              break;
-                            }
-                          }
-                        }
-
-                        // If we have an expected tx hash, verify it matches (if we found one)
-                        if (expectedTxHash && txHash && txHash !== expectedTxHash) {
-                          continue; // Skip if hash doesn't match
-                        }
-
-                        txFound = true;
-                        foundAt = nextHeight;
-                        confirmedTxHash = txHash || expectedTxHash;
-                        logger.info(
-                          {
-                            flowId: params.flowId,
-                            height: nextHeight,
-                            txHash: confirmedTxHash,
-                            memo,
-                            receiver,
-                            amount,
-                          },
-                          'Namada send_packet matched'
-                        );
-                        onUpdate?.({ height: nextHeight, txHash: confirmedTxHash });
-                        break;
-                      }
-                    } catch (error) {
-                      logger.debug(
-                        { err: error, flowId: params.flowId },
-                        'Namada payment poll packet_data parse failed'
-                      );
-                    }
-                  }
-
-                  // Check for ibc_transfer event (alternative to send_packet)
-                  if (ev?.type === 'ibc_transfer') {
-                    const attrs = indexAttributes(ev.attributes);
-                    const receiver = attrs['receiver'];
-                    const amount = attrs['amount'];
-                    const denomFromEvent = attrs['denom'];
-
-                    // Match receiver, amount, and denom
-                    const receiverMatches = expectedReceiver ? receiver === expectedReceiver : true;
-                    const denomMatches = denomFromEvent === denom;
-
-                    // Handle amount comparison
-                    let amountMatches = true;
-                    if (expectedAmount) {
-                      const expectedNumeric = expectedAmount.replace('uusdc', '');
-                      const actualNumeric = amount?.toString().replace('uusdc', '') || '';
-                      amountMatches = expectedNumeric === actualNumeric;
-                    }
-
-                    // For ibc_transfer, we can't match memo directly, so we rely on receiver/amount/denom
-                    // If we have a transaction hash, we should also match it
-                    if (receiverMatches && denomMatches && amountMatches) {
-                      // Try to extract transaction hash
-                      let txHash: string | undefined;
-                      for (const otherEv of events) {
-                        if (otherEv?.type === 'message') {
-                          const msgAttrs = indexAttributes(otherEv.attributes);
-                          const innerHash = msgAttrs['inner-tx-hash'] || msgAttrs['tx_hash'];
-                          if (innerHash) {
-                            txHash = innerHash;
-                            break;
-                          }
-                        }
-                      }
-
-                      // If we have an expected tx hash, verify it matches (if we found one)
-                      if (expectedTxHash && txHash && txHash !== expectedTxHash) {
-                        continue; // Skip if hash doesn't match
-                      }
-
-                      txFound = true;
-                      foundAt = nextHeight;
-                      confirmedTxHash = txHash || expectedTxHash;
-                      logger.info(
-                        {
-                          flowId: params.flowId,
-                          height: nextHeight,
-                          txHash: confirmedTxHash,
-                          receiver,
-                          amount,
-                        },
-                        'Namada ibc_transfer matched'
-                      );
-                      onUpdate?.({ height: nextHeight, txHash: confirmedTxHash });
-                      break;
-                    }
-                  }
-                }
-
-                if (txFound) break;
-              }
-            } catch (error) {
-              // Check if error is permanent (404 = block doesn't exist)
-              if (isPermanentError(error)) {
-                logger.debug(
-                  { err: error, flowId: params.flowId, height: nextHeight },
-                  'Namada payment poll: permanent error for height, skipping'
-                );
-                nextHeight++;
-                await sleep(blockRequestDelayMs);
-                continue;
-              }
-
-              // Transient errors should have been retried by retryWithBackoff
-              // If we still get here, log warning and skip block after max retries
-              logger.warn(
-                { err: error, flowId: params.flowId, height: nextHeight },
-                'Namada payment poll fetch failed for height after retries, skipping block'
-              );
-              nextHeight++;
-              await sleep(blockRequestDelayMs);
-              continue;
-            }
-
-            nextHeight++;
-            // Add delay before next block request to avoid rate limiting
-            await sleep(blockRequestDelayMs);
-          }
-
-          if (txFound) break;
-          await sleep(intervalMs);
-        }
-
-        logger.info(
-          { flowId: params.flowId, txFound, foundAt, txHash: confirmedTxHash },
-          'Namada payment poll completed'
+      // Require block height and tx hash for payment flow polling
+      if (params.namadaBlockHeight === undefined || !params.namadaIbcTxHash) {
+        logger.warn(
+          { flowId: params.flowId, hasBlockHeight: params.namadaBlockHeight !== undefined, hasTxHash: !!params.namadaIbcTxHash },
+          'Namada payment polling requires blockHeight and txHash'
         );
-
-        return {
-          success: txFound,
-          found: txFound,
-          namadaTxHash: confirmedTxHash,
-          foundAt,
-        };
-      } catch (error) {
-        logger.error({ err: error, flowId: params.flowId }, 'Namada payment poll error');
         return {
           success: false,
           found: false,
-          error: error instanceof Error ? error.message : String(error),
+          error: 'Namada payment polling requires namadaBlockHeight and namadaIbcTxHash',
         };
-      } finally {
-        cleanup();
       }
+
+      // Use new direct lookup approach
+      return pollForPaymentIbcSend(params, onUpdate, rpcClient, logger);
     },
   };
 }

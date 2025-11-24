@@ -13,6 +13,7 @@ export interface ChainPollingConfig {
   blockWindowBackscan: number; // Number of blocks to scan backwards on startup
   pollIntervalMs: number; // Interval between poll attempts (milliseconds)
   blockRequestDelayMs?: number; // Delay between consecutive block_results requests (milliseconds)
+  maxBlockRange?: number; // Maximum block span per RPC query (mainly for EVM chains)
   iris?: IrisPollingConfig; // Iris attestation polling configuration
 }
 
@@ -30,6 +31,7 @@ const DEFAULT_POLLING_CONFIG: ChainPollingConfig = {
   blockWindowBackscan: 50,
   pollIntervalMs: 5000,
   blockRequestDelayMs: 100, // Default 100ms delay between block requests
+  maxBlockRange: 2000, // Default max block span per RPC query
 };
 
 const FALLBACK_CHAIN_CONFIGS: ChainPollingConfigs = {
@@ -101,6 +103,14 @@ export function loadChainPollingConfigs(
 
   // Start with fallback configs
   const configs: ChainPollingConfigs = { ...FALLBACK_CHAIN_CONFIGS };
+
+  // Ensure fallback configs include default values
+  for (const [chainId, chainConfig] of Object.entries(configs)) {
+    configs[chainId] = {
+      ...DEFAULT_POLLING_CONFIG,
+      ...chainConfig,
+    };
+  }
 
   // Override from environment variables if provided
   const envConfigs = process.env.CHAIN_POLLING_CONFIGS;

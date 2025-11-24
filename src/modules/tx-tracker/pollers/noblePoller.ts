@@ -26,7 +26,8 @@ export interface NoblePollParams extends PollParams {
   mintRecipientB64?: string;
   destinationDomain?: number;
   channelId?: string;
-  cctpNonce?: number; // CCTP message nonce extracted from MessageSent event
+  cctpNonce?: number; // CCTP message nonce extracted from MessageSent event (for deposit flow)
+  packetSequence?: number; // IBC packet sequence number (for payment flow, from Namada polling)
 }
 
 export interface NoblePollResult extends PollResult {
@@ -39,6 +40,7 @@ export interface NoblePollResult extends PollResult {
   ackAt?: number;
   cctpAt?: number;
   packetSequence?: number; // IBC packet sequence number (required for Namada polling)
+  cctpNonce?: number; // CCTP nonce extracted from DepositForBurn event (for EVM polling)
   retryExhausted?: boolean; // Flag indicating RPC retry exhaustion
 }
 
@@ -314,6 +316,239 @@ async function pollForDepositWithNonce(
     logger.error(
       { flowId: params.flowId, err: error, cctpNonce: params.cctpNonce },
       'Noble deposit poll with nonce error'
+    );
+    return {
+      success: false,
+      found: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    cleanup();
+  }
+}
+
+/**
+ * Efficient polling approach for payment flow using tx_search by packet_sequence.
+ * Finds write_acknowledgement event (Noble IBC received) and extracts CCTP nonce from DepositForBurn event.
+ */
+async function pollForPaymentWithPacketSequence(
+  params: NoblePollParams,
+  onUpdate?: PollUpdateCallback,
+  rpcClient?: TendermintRpcClient,
+  logger?: AppLogger
+): Promise<NoblePollResult> {
+  if (!rpcClient || !logger) {
+    throw new Error('rpcClient and logger required for pollForPaymentWithPacketSequence');
+  }
+
+  const timeoutMs = params.timeoutMs ?? 30 * 60 * 1000;
+  const txSearchTimeoutMs = 2 * 60 * 1000; // 2 minutes for tx_search
+  const txSearchIntervalMs = 3000; // 3 seconds
+  const { controller, cleanup } = createPollTimeout(
+    timeoutMs,
+    logger,
+    params.flowId
+  );
+  const abortSignal = params.abortSignal || controller.signal;
+  const isAborted = () => abortSignal.aborted || controller.signal.aborted;
+
+  logger.info(
+    {
+      flowId: params.flowId,
+      packetSequence: params.packetSequence,
+    },
+    'Starting Noble payment polling with packet_sequence (new approach)'
+  );
+
+  try {
+    // Step 1: Search for write_acknowledgement event by packet_sequence using tx_search
+    // Query format: write_acknowledgement.packet_sequence='<SEQUENCE>'
+    // The entire query will be wrapped in double quotes by searchTransactions
+    const query = `write_acknowledgement.packet_sequence='${params.packetSequence}'`;
+    logger.debug({ flowId: params.flowId, query, packetSequence: params.packetSequence }, 'Searching for write_acknowledgement event');
+
+    const txSearchDeadline = Date.now() + txSearchTimeoutMs;
+    let ackTx: Awaited<ReturnType<typeof rpcClient.searchTransactions>>[0] | null = null;
+    let ackBlockHeight: number | null = null;
+
+    while (Date.now() < txSearchDeadline) {
+      if (isAborted()) {
+        return {
+          success: false,
+          found: false,
+          error: 'Polling aborted',
+        };
+      }
+
+      try {
+        const txs = await rpcClient.searchTransactions(query, 1, 1);
+        
+        if (txs.length > 0) {
+          const tx = txs[0];
+          
+          // Verify the transaction has the write_acknowledgement event with matching packet_sequence
+          const txResult = (tx as any).tx_result || (tx as any).result;
+          const events = txResult?.events || [];
+          
+          let packetSeqMatched = false;
+          let packetAck: string | undefined;
+          
+          for (const event of events) {
+            if (event.type === 'write_acknowledgement') {
+              const attrs = indexAttributes(event.attributes || []);
+              const eventPacketSeq = attrs['packet_sequence'];
+              packetAck = attrs['packet_ack'];
+              
+              if (eventPacketSeq === String(params.packetSequence)) {
+                packetSeqMatched = true;
+                break;
+              }
+            }
+          }
+
+          if (packetSeqMatched) {
+            // Verify packet_ack is success code
+            if (packetAck !== '{"result":"AQ=="}') {
+              logger.error(
+                {
+                  flowId: params.flowId,
+                  packetSequence: params.packetSequence,
+                  packetAck,
+                },
+                'Packet acknowledgement indicates failure'
+              );
+              return {
+                success: false,
+                found: false,
+                error: `Packet acknowledgement indicates failure: ${packetAck}`,
+                ackFound: false,
+              };
+            }
+
+            ackTx = tx as any;
+            ackBlockHeight = Number.parseInt(tx.height, 10);
+            logger.info(
+              {
+                flowId: params.flowId,
+                packetSequence: params.packetSequence,
+                blockHeight: ackBlockHeight,
+                txHash: tx.hash,
+              },
+              'write_acknowledgement event found via tx_search'
+            );
+            
+            // Emit NOBLE_RECEIVED stage (IBC ack received)
+            logger.debug(
+              { flowId: params.flowId, ackFound: true, cctpFound: false },
+              'Calling onUpdate callback for IBC acknowledgement'
+            );
+            await onUpdate?.({ height: ackBlockHeight, ackFound: true, cctpFound: false });
+            logger.debug(
+              { flowId: params.flowId },
+              'onUpdate callback completed for IBC acknowledgement'
+            );
+            break;
+          }
+        }
+      } catch (error) {
+        logger.warn(
+          { flowId: params.flowId, err: error, query },
+          'tx_search request failed, retrying'
+        );
+      }
+
+      await sleep(txSearchIntervalMs);
+    }
+
+    if (!ackTx || !ackBlockHeight) {
+      return {
+        success: false,
+        found: false,
+        error: `write_acknowledgement event not found for packet_sequence ${params.packetSequence} within ${txSearchTimeoutMs}ms`,
+        ackFound: false,
+      };
+    }
+
+    // Step 2: Search for DepositForBurn event in the same transaction
+    logger.debug(
+      { flowId: params.flowId, blockHeight: ackBlockHeight },
+      'Searching for DepositForBurn event in transaction'
+    );
+
+    const txResult = (ackTx as any).tx_result || (ackTx as any).result;
+    const events = txResult?.events || [];
+    
+    let cctpNonce: number | undefined;
+    let cctpFound = false;
+
+    for (const event of events) {
+      if (event.type === 'circle.cctp.v1.DepositForBurn') {
+        const attrs = indexAttributes(event.attributes || []);
+        const nonceStr = stripQuotes(attrs['nonce']);
+        
+        if (nonceStr) {
+          cctpNonce = Number.parseInt(nonceStr, 10);
+          if (!cctpNonce || cctpNonce <= 0) {
+            logger.warn(
+              {
+                flowId: params.flowId,
+                blockHeight: ackBlockHeight,
+                nonceStr,
+              },
+              'Invalid CCTP nonce value'
+            );
+            continue;
+          }
+
+          cctpFound = true;
+          logger.info(
+            {
+              flowId: params.flowId,
+              blockHeight: ackBlockHeight,
+              cctpNonce,
+            },
+            'CCTP DepositForBurn event found, nonce extracted'
+          );
+          
+          // Emit NOBLE_CCTP_BURNED stage (CCTP burn for mint)
+          logger.debug(
+            { flowId: params.flowId, ackFound: true, cctpFound: true },
+            'Calling onUpdate callback for CCTP burn'
+          );
+          await onUpdate?.({ height: ackBlockHeight, ackFound: true, cctpFound: true });
+          logger.debug(
+            { flowId: params.flowId },
+            'onUpdate callback completed for CCTP burn'
+          );
+          break;
+        }
+      }
+    }
+
+    if (!cctpFound) {
+      logger.warn(
+        {
+          flowId: params.flowId,
+          blockHeight: ackBlockHeight,
+          packetSequence: params.packetSequence,
+        },
+        'write_acknowledgement found but DepositForBurn event not found in same transaction'
+      );
+    }
+
+    return {
+      success: true,
+      found: true,
+      ackFound: true,
+      cctpFound,
+      ackAt: ackBlockHeight,
+      cctpAt: cctpFound ? ackBlockHeight : undefined,
+      cctpNonce, // Return nonce for EVM polling
+    };
+  } catch (error) {
+    logger.error(
+      { flowId: params.flowId, err: error, packetSequence: params.packetSequence },
+      'Noble payment poll with packet_sequence error'
     );
     return {
       success: false,
@@ -696,6 +931,10 @@ export function createNoblePoller(
     pollForDepositWithNonce(params, onUpdate, rpcClient, logger);
   const pollForDepositIterativeBound = (params: NoblePollParams, onUpdate?: PollUpdateCallback) =>
     pollForDepositIterative(params, onUpdate, rpcClient, logger);
+  const pollForPaymentWithPacketSequenceBound = (params: NoblePollParams, onUpdate?: PollUpdateCallback) =>
+    pollForPaymentWithPacketSequence(params, onUpdate, rpcClient, logger);
+  const pollForOrbiterIterativeBound = (params: NoblePollParams, onUpdate?: PollUpdateCallback) =>
+    pollForOrbiterIterative(params, onUpdate, rpcClient, logger);
 
   return {
     async pollForDeposit(params, onUpdate) {
@@ -709,6 +948,30 @@ export function createNoblePoller(
     },
 
     async pollForOrbiter(params, onUpdate) {
+      // If packetSequence is provided, use new efficient approach
+      if (params.packetSequence !== undefined) {
+        return pollForPaymentWithPacketSequenceBound(params, onUpdate);
+      }
+      
+      // Otherwise, fall back to old iterative approach
+      return pollForOrbiterIterativeBound(params, onUpdate);
+    },
+  };
+}
+
+/**
+ * Old iterative polling approach for payment flow (fallback when packetSequence is not provided)
+ */
+async function pollForOrbiterIterative(
+  params: NoblePollParams,
+  onUpdate?: PollUpdateCallback,
+  rpcClient?: TendermintRpcClient,
+  logger?: AppLogger
+): Promise<NoblePollResult> {
+  if (!rpcClient || !logger) {
+    throw new Error('rpcClient and logger required for pollForOrbiterIterative');
+  }
+
       const timeoutMs = params.timeoutMs ?? 30 * 60 * 1000;
       const intervalMs = params.intervalMs ?? 5000;
       const blockRequestDelayMs = params.blockRequestDelayMs ?? 100;
@@ -940,7 +1203,5 @@ export function createNoblePoller(
       } finally {
         cleanup();
       }
-    },
-  };
 }
 

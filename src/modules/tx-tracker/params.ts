@@ -120,6 +120,12 @@ export function buildFlowTrackingParams(
     params.namadaIbcTxHash = namadaIbcTxHash;
   }
 
+    // Extract block height from metadata (frontend passes as 'blockHeight')
+    const blockHeight = getNumber(metadata, 'blockHeight');
+    if (blockHeight !== undefined) {
+      params.namadaBlockHeight = blockHeight;
+    }
+
     const amount = getString(metadata, 'amount');
     if (amount) {
       params.amount = amount;
